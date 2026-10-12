@@ -35,14 +35,6 @@ export type StatusbarGit = {
   changes: StatusbarGitChanges
 }
 
-// TodoWrite의 항목에는 id가 없고, TaskCreate가 만든 작업에는 있다.
-export type StatusbarTodo = {
-  id?: string
-  subject: string
-  activeForm?: string
-  status: 'pending' | 'in_progress' | 'completed'
-}
-
 // 상태 줄이 그리는 한 시점의 값. fable이 없으면 요금제 한도가 없는 세션이다.
 export type StatusbarSnapshot = {
   model: string
@@ -53,7 +45,6 @@ export type StatusbarSnapshot = {
   fable?: StatusbarFable
   fableFetchedAt?: number
   git?: StatusbarGit
-  todos?: StatusbarTodo[]
   now: number
 }
 

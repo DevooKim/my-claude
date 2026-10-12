@@ -5,7 +5,6 @@ import type {
   RenderElement,
   RenderSurface,
   SessionAuthorization,
-  SessionMessage,
   SessionRateLimit,
   SessionUsage,
   TurnStepInput,
@@ -13,7 +12,6 @@ import type {
 
 import type { StatusbarGit, StatusbarSnapshot } from '../types'
 import {
-  applyTodoTool,
   displayWidth,
   effortFrom,
   effortSpans,
@@ -26,7 +24,6 @@ import {
   prettyModel,
   resetIn,
   statusOf,
-  todoProgress,
 } from '../hooks/register'
 import type { Span } from '../hooks/register'
 
@@ -107,7 +104,6 @@ type World = {
   env: Record<string, string>
   repo?: Repo
   isFsRefused: boolean
-  messages: SessionMessage[]
   bash: Record<string, unknown>
 }
 
@@ -120,7 +116,6 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
     settings: {},
     env: {},
     isFsRefused: false,
-    messages: [],
     bash: { stdout: '', stderr: '', interrupted: false },
     ...initial,
   }
@@ -192,21 +187,8 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
       ? { deny: 'outside the workspace' }
       : { value: (world.repo?.markers ?? []).some(marker => e.path.endsWith(`/${marker}`)) },
   )
-  on('session.messages', () => ({ value: world.messages }))
-  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
-  // 도구는 엔진이 답하듯 기록을 돌려준다. TaskCreate는 1부터 id를 매긴다.
-  const tasks = { count: 0 }
-  on('tool.call', ($, e) => {
-    if (e.tool === 'TodoWrite') return { result: { oldTodos: [], newTodos: e.todos } }
-    if (e.tool === 'TaskCreate') {
-      tasks.count += 1
-
-      return { result: { task: { id: String(tasks.count), subject: e.subject } } }
-    }
-    if (e.tool === 'TaskUpdate') return { result: { success: true, taskId: e.taskId, updatedFields: ['status'] } }
-
-    return { result: world.bash }
-  })
+  // 도구는 엔진이 답하듯 기록을 돌려준다.
+  on('tool.call', () => ({ result: world.bash }))
 
   return { world, fetches, clock, redraws, session, runs }
 }
@@ -614,83 +596,6 @@ describe('git row', () => {
   })
 })
 
-describe('todos row', () => {
-  const TODOS = [
-    { content: 'Parse git status', status: 'completed', activeForm: 'Parsing git status' },
-    { content: 'Draw the git row', status: 'in_progress', activeForm: 'Drawing the git row' },
-    { content: 'Update README', status: 'pending', activeForm: 'Updating README' },
-  ] as const
-
-  test('TodoWrite shows done/total and what runs now; it leaves once all are done', async ($, on) => {
-    const { clock } = setUp(on, { model: 'claude-opus-5-5' })
-
-    await $.session.start(START)
-    await clock.settle()
-    await $.tool.call({ tool: 'TodoWrite', todos: [...TODOS] })
-    await clock.settle()
-    expect(await bar($)).toEqual([OPUS_ROW, 'T ●●○ 1/3  Drawing the git row'])
-
-    await $.tool.call({ tool: 'TodoWrite', todos: TODOS.map(todo => ({ ...todo, status: 'completed' as const })) })
-    await clock.settle()
-    expect(await bar($)).toEqual([OPUS_ROW])
-  })
-
-  test('tasks follow TaskCreate and TaskUpdate, deletions included', async ($, on) => {
-    const { clock } = setUp(on, { model: 'claude-opus-5-5' })
-    const last = async () => (await bar($)).at(-1)
-
-    await $.session.start(START)
-    await $.tool.call({ tool: 'TaskCreate', subject: 'Read git', description: 'porcelain v2', activeForm: 'git 상태 읽는 중' })
-    await $.tool.call({ tool: 'TaskCreate', subject: 'Draw the row', description: 'spans' })
-    await $.tool.call({ tool: 'TaskUpdate', taskId: '1', status: 'in_progress' })
-    await clock.settle()
-    expect(await last()).toBe('T ●○ 0/2  git 상태 읽는 중')
-
-    await $.tool.call({ tool: 'TaskUpdate', taskId: '1', status: 'completed' })
-    await $.tool.call({ tool: 'TaskUpdate', taskId: '2', status: 'in_progress' })
-    await clock.settle()
-    expect(await last()).toBe('T ●● 1/2  Draw the row')
-
-    await $.tool.call({ tool: 'TaskUpdate', taskId: '2', status: 'deleted' })
-    await clock.settle()
-    expect(await bar($)).toEqual([OPUS_ROW])
-  })
-
-  test('a /clear drops the todos', async ($, on) => {
-    const { clock, session } = setUp(on, { model: 'claude-opus-5-5' })
-
-    await $.session.start(START)
-    await $.tool.call({ tool: 'TodoWrite', todos: [...TODOS] })
-    await clock.settle()
-    expect(await bar($)).toHaveLength(2)
-
-    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
-    session.wipe()
-    expect(await footer($)).toEqual([ENGINE_LINE])
-    await clock.settle()
-    expect(await bar($)).toEqual([OPUS_ROW])
-  })
-
-  test('a resumed session picks its todos up from the transcript', async ($, on) => {
-    const { clock } = setUp(on, {
-      model: 'claude-opus-5-5',
-      messages: [
-        { role: 'user', text: 'Add a git row', toolUses: [] },
-        {
-          role: 'assistant',
-          text: '',
-          toolUses: [{ tool_use_id: 'toolu_1', tool: 'TodoWrite', input: { todos: [...TODOS] }, result: {} }],
-        },
-      ],
-    })
-
-    await $.session.start(START)
-    await clock.settle()
-    expect((await bar($)).at(-1)).toBe('T ●●○ 1/3  Drawing the git row')
-  })
-
-})
-
 const SNAPSHOT: StatusbarSnapshot = {
   model: 'claude-fable-5-1',
   effort: { kind: 'level', level: 'max' },
@@ -842,48 +747,6 @@ describe('layout', () => {
     expect(gitStatusText({ changes: NONE, upstream: { ahead: 0, behind: 4 } })).toBe('⇣4')
     expect(gitStatusText({ changes: NONE })).toBe('')
   })
-
-  test('the todos row shortens what runs now, then keeps only the count', () => {
-    const snapshot: StatusbarSnapshot = {
-      ...SNAPSHOT,
-      todos: [
-        { id: '1', subject: 'Read git', status: 'completed' },
-        { id: '2', subject: 'Draw', activeForm: '상태 줄에 git 줄을 그리는 중', status: 'in_progress' },
-        { id: '3', subject: 'Test', status: 'pending' },
-      ],
-    }
-    const todoRow = (columns: number) => textOfRow(layoutRows(snapshot, columns).at(-1) ?? [])
-
-    expect(todoRow(200)).toBe('T ●●○ 1/3  상태 줄에 git 줄을 그리는 중')
-    expect(todoRow(30)).toBe('T ●●○ 1/3  상태 줄에 g…')
-    expect(todoRow(10)).toBe('T ●●○ 1/3')
-  })
-
-  test('todo dots: one per todo in done, running and left colors; past ten they share ten dots', () => {
-    const todosOf = (done: number, running: number, left: number): StatusbarSnapshot['todos'] => [
-      ...Array.from({ length: done }, (_, index) => ({ subject: `done ${index}`, status: 'completed' as const })),
-      ...Array.from({ length: running }, (_, index) => ({ subject: `run ${index}`, status: 'in_progress' as const })),
-      ...Array.from({ length: left }, (_, index) => ({ subject: `left ${index}`, status: 'pending' as const })),
-    ]
-    const dots = (done: number, running: number, left: number) =>
-      (layoutRows({ ...SNAPSHOT, todos: todosOf(done, running, left) }, 200).at(-1) ?? [])
-        .filter(part => /^[●○]+$/.test(part.text))
-        .map(part => [part.text, part.style?.color])
-
-    expect(dots(2, 1, 3)).toEqual([
-      ['●●', '#0ca30c'],
-      ['●', 'claude'],
-      ['○○○', 'inactive'],
-    ])
-    expect(dots(5, 1, 6)).toEqual([
-      ['●●●●', '#0ca30c'],
-      ['●', 'claude'],
-      ['○○○○○', 'inactive'],
-    ])
-    expect(textOfRow(layoutRows({ ...SNAPSHOT, todos: todosOf(5, 1, 6) }, 200).at(-1) ?? [])).toBe(
-      'T ●●●●●○○○○○ 5/12  run 0',
-    )
-  })
 })
 
 describe('formatting', () => {
@@ -953,19 +816,6 @@ describe('formatting', () => {
       commit: '1234567',
       changes: none,
     })
-  })
-
-  test('TaskList replaces the list and keeps what TaskCreate said', () => {
-    const created = applyTodoTool([], 'TaskCreate', { subject: 'A', activeForm: 'Doing A' }, { task: { id: '1', subject: 'A' } })
-    const listed = applyTodoTool(created, 'TaskList', {}, {
-      tasks: [
-        { id: '1', subject: 'A', status: 'in_progress', blockedBy: [] },
-        { id: '2', subject: 'B', status: 'pending', blockedBy: [] },
-      ],
-    })
-    expect(todoProgress(listed)).toEqual({ done: 0, active: 1, total: 2, current: 'Doing A' })
-    expect(todoProgress([])).toBeUndefined()
-    expect(applyTodoTool(listed, 'TaskUpdate', { taskId: '1', status: 'completed' }, { success: false })).toEqual(listed)
   })
 
   test('fitted text', () => {

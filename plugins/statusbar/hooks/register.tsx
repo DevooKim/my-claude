@@ -8,7 +8,6 @@ import type {
   SessionRateLimit,
   SessionUsage,
   Timer,
-  ToolCallInput,
   ToolCallResult,
   TurnStepInput,
 } from 'claude-code'
@@ -19,7 +18,6 @@ import type {
   StatusbarGit,
   StatusbarGitOperation,
   StatusbarSnapshot,
-  StatusbarTodo,
   StatusbarWindow,
 } from '../types'
 
@@ -38,7 +36,7 @@ const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max']
 // git은 파일을 바꾸는 도구가 끝날 때마다, 그리고 바깥(다른 터미널)에서 바꾼 것도 잡도록 주기적으로 읽는다.
 const GIT_TICK_MS = 15_000
 const GIT_TIMEOUT_MS = 10_000
-// 끝나면 git 상태를 다시 읽는 도구와 할 일 목록을 바꾸는 도구.
+// 끝나면 git 상태를 다시 읽는 도구.
 const WATCHED_TOOLS = [
   'Bash',
   'Edit',
@@ -46,14 +44,7 @@ const WATCHED_TOOLS = [
   'NotebookEdit',
   'EnterWorktree',
   'ExitWorktree',
-  'TodoWrite',
-  'TaskCreate',
-  'TaskUpdate',
-  'TaskList',
-  'TaskGet',
 ] as const
-const TODO_TOOLS: ReadonlySet<string> = new Set(['TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet'])
-const TODO_STATUSES = ['pending', 'in_progress', 'completed']
 // git 디렉터리에 남는 표시 파일로 진행 중인 작업을 알아본다.
 const GIT_OPERATIONS: readonly (readonly [string, StatusbarGitOperation])[] = [
   ['rebase-merge', 'rebasing'],
@@ -73,7 +64,6 @@ const LABEL_COLORS: Readonly<Record<string, string>> = {
   C: 'claude',
   S: 'suggestion',
   W: 'planMode',
-  T: 'success',
 }
 // 바의 색은 남은 비율의 단계: 라이트·다크 양쪽에서 검증된 고정 상태 색이다.
 const STATUS_COLORS = {
@@ -120,8 +110,6 @@ const BRANCH_COLOR = 'gray'
 const COMMIT_COLOR = 'green'
 const GIT_STATUS_COLOR = 'yellow'
 const MIN_BRANCH_COLUMNS = 12
-// 할 일 줄: 할 일 하나에 점 하나(끝냄·진행 중·남음).
-const MAX_TODO_DOTS = 10
 
 const snapshotAtom = atom({ plugin: 'statusbar', key: 'snapshot' } as const, null, {
   shape: 'v1',
@@ -153,7 +141,6 @@ type State = {
   gitTicker: Timer | undefined
   gitQueue: Promise<void>
   isGitQueued: boolean
-  todos: StatusbarTodo[]
 }
 
 // 애니메이션의 현재 칸. 움직임을 줄인 설정이면 undefined로 멈춘 모습을 그린다.
@@ -177,9 +164,6 @@ const VARIANTS: readonly Variant[] = [
   { rows: 'stack', bar: 8, extras: true },
   { rows: 'stack', bar: 5, extras: false },
 ]
-
-// 할 일 줄도 넓은 것부터: 진행 중 항목을 40칸 → 24칸 → 12칸까지 줄이다가 개수만 남긴다.
-const TODO_TEXT_COLUMNS = [40, 24, 12, 0]
 
 export const register: Register = on => {
   const state: State = {
@@ -205,7 +189,6 @@ export const register: Register = on => {
     gitTicker: undefined,
     gitQueue: Promise.resolve(),
     isGitQueued: false,
-    todos: [],
   }
 
   on('session.start', async ($, e, next) => {
@@ -215,7 +198,6 @@ export const register: Register = on => {
       $.ui.status(undefined)
       await restore($, state)
       if (state.effort.kind === 'unknown') state.effort = await configuredEffort($)
-      if (state.todos.length === 0) state.todos = await replayedTodos($)
       state.isReducedMotion = await prefersReducedMotion($)
       startLive($, state)
     }
@@ -223,17 +205,10 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // /clear와 /resume은 다른 대화로 넘어가므로 할 일 목록도 비운다(다시 세울 때 새 대화에서 읽는다).
-  on('session.end', ($, e, next) => {
-    if (e.reason === 'clear' || e.reason === 'resume') state.todos = []
-
-    return next(e)
-  }).catch(($, e, next) => next(e))
-
-  // 도구의 결과는 손대지 않고 그대로 돌려준다: 끝난 뒤에 할 일과 git 상태만 따라 읽는다.
+  // 도구의 결과는 손대지 않고 그대로 돌려준다: 파일을 바꾼 도구가 끝나면 git 상태를 다시 읽는다.
   on('tool.call', { tool: WATCHED_TOOLS }, async ($, e, next) => {
     const result = await next(e)
-    if (state.isLive) noteTool($, state, e, result)
+    if (state.isLive) noteTool($, state, result)
 
     return result
   }).catch(($, e, next) => next(e))
@@ -285,15 +260,7 @@ export const register: Register = on => {
       // 그래서 이미 쓴 스냅숏이 비어 읽히면 그리기 밖(타이머)에서 다시 세운다.
       if (state.isLive && state.published !== undefined) {
         state.published = undefined
-        state.todos = []
-        $.clock.after(0, () => {
-          startLive($, state)
-          void replayedTodos($).then(todos => {
-            if (todos.length === 0) return
-            state.todos = todos
-            schedule($, state)
-          })
-        })
+        $.clock.after(0, () => startLive($, state))
       }
 
       return own
@@ -329,7 +296,6 @@ async function restore($: EngineInterface, state: State): Promise<void> {
   if (previous.fable !== undefined) state.fable = previous.fable
   if (previous.fableFetchedAt !== undefined) state.lastFetchedAt = previous.fableFetchedAt
   if (previous.git !== undefined) state.git = previous.git
-  if (previous.todos !== undefined) state.todos = previous.todos
 }
 
 // 타이머를 새로 걸고 스냅숏을 다시 쓴다. 몇 번 불러도 같은 모습이 된다.
@@ -494,7 +460,6 @@ function snapshotOf(
     ...(state.hasPlan ? { fable: state.fable } : {}),
     ...(Number.isFinite(state.lastFetchedAt) ? { fableFetchedAt: state.lastFetchedAt } : {}),
     ...(git ? { git } : {}),
-    ...(state.todos.length > 0 ? { todos: state.todos } : {}),
   }
 }
 
@@ -661,130 +626,15 @@ export function gitStatusOf(text: string): Omit<StatusbarGit, 'project' | 'workt
   }
 }
 
-function noteTool($: EngineInterface, state: State, e: ToolCallInput, result: ToolCallResult): void {
-  try {
-    if (result.deny !== undefined || result.isError === true) return
-    const tool = String(e.tool)
-    // TodoWrite는 에이전트마다 따로 목록을 두므로 메인의 것만, 작업(Task*)은 함께 쓰는 목록이라 모두 읽는다.
-    if (TODO_TOOLS.has(tool) && (tool !== 'TodoWrite' || e.agentId === undefined)) {
-      const todos = applyTodoTool(state.todos, tool, toolInputOf(e), result.result)
-      if (JSON.stringify(todos) !== JSON.stringify(state.todos)) {
-        state.todos = todos
-        schedule($, state)
-      }
-
-      return
-    }
-    if (result.isReadOnly !== true) $.clock.after(0, () => void refreshGit($, state))
-  } catch (error) {
-    $.ui.log(`statusbar: tool result not noted: ${describe(error)}`, { to: 'debug' })
-  }
+// 파일을 바꿨을 수 있는 도구(읽기 전용이 아닌 호출)가 끝나면 git 상태를 다시 읽는다.
+function noteTool($: EngineInterface, state: State, result: ToolCallResult): void {
+  if (result.deny !== undefined || result.isError === true || result.isReadOnly === true) return
+  $.clock.after(0, () => void refreshGit($, state))
 }
 
-// tool.call의 입력은 도구 인자를 tool·tool_use_id 옆에 펼쳐 둔 값이다.
-function toolInputOf(e: ToolCallInput): Json {
-  const input: unknown = e
-
-  return isRecord(input) ? input : {}
-}
-
-// 할 일 도구 하나의 결과를 목록에 반영한다. TodoWrite는 목록 전체를, TaskList는 작업 전체를 준다.
-export function applyTodoTool(
-  todos: readonly StatusbarTodo[],
-  tool: string,
-  input: Json,
-  result: unknown,
-): StatusbarTodo[] {
-  const record = isRecord(result) ? result : {}
-  switch (tool) {
-    case 'TodoWrite':
-      return (Array.isArray(input.todos) ? input.todos : []).flatMap(item =>
-        isRecord(item) && typeof item.content === 'string' && isTodoStatus(item.status)
-          ? [todoOf(undefined, item.content, item.status, item.activeForm)]
-          : [],
-      )
-    case 'TaskCreate': {
-      const task = isRecord(record.task) ? record.task : undefined
-      if (task === undefined || typeof task.id !== 'string') return [...todos]
-      const subject = typeof task.subject === 'string' ? task.subject : String(input.subject ?? '')
-
-      return [...todos.filter(todo => todo.id !== task.id), todoOf(task.id, subject, 'pending', input.activeForm)]
-    }
-    case 'TaskUpdate': {
-      const { taskId, status } = input
-      if (record.success !== true || typeof taskId !== 'string') return [...todos]
-      if (status === 'deleted') return todos.filter(todo => todo.id !== taskId)
-
-      return todos.map(todo =>
-        todo.id === taskId
-          ? todoOf(
-              todo.id,
-              typeof input.subject === 'string' ? input.subject : todo.subject,
-              isTodoStatus(status) ? status : todo.status,
-              typeof input.activeForm === 'string' ? input.activeForm : todo.activeForm,
-            )
-          : todo,
-      )
-    }
-    case 'TaskList':
-      if (!Array.isArray(record.tasks)) return [...todos]
-
-      return record.tasks.flatMap(task =>
-        isRecord(task) && typeof task.id === 'string' && typeof task.subject === 'string' && isTodoStatus(task.status)
-          ? [todoOf(task.id, task.subject, task.status, todos.find(todo => todo.id === task.id)?.activeForm)]
-          : [],
-      )
-    case 'TaskGet': {
-      const task = isRecord(record.task) ? record.task : undefined
-      if (task === undefined || typeof task.id !== 'string' || !isTodoStatus(task.status)) return [...todos]
-      const known = todos.find(todo => todo.id === task.id)
-      const subject = typeof task.subject === 'string' ? task.subject : (known?.subject ?? '')
-      const fresh = todoOf(task.id, subject, task.status, known?.activeForm)
-
-      return known === undefined ? [...todos, fresh] : todos.map(todo => (todo === known ? fresh : todo))
-    }
-    default:
-      return [...todos]
-  }
-}
-
-function todoOf(id: string | undefined, subject: string, status: StatusbarTodo['status'], activeForm: unknown): StatusbarTodo {
-  return {
-    ...(id !== undefined ? { id } : {}),
-    subject,
-    status,
-    ...(typeof activeForm === 'string' && activeForm !== '' ? { activeForm } : {}),
-  }
-}
-
-function isTodoStatus(value: unknown): value is StatusbarTodo['status'] {
-  return typeof value === 'string' && TODO_STATUSES.includes(value)
-}
-
-// 이어 붙인 세션은 상태가 비어 있으므로 대화에 남은 할 일 도구 호출을 차례로 다시 적용한다.
-async function replayedTodos($: EngineInterface): Promise<StatusbarTodo[]> {
-  try {
-    let todos: StatusbarTodo[] = []
-    for (const message of await $.session.messages()) {
-      for (const use of message.toolUses) {
-        if (TODO_TOOLS.has(use.tool) && use.isError !== true) {
-          todos = applyTodoTool(todos, use.tool, use.input, use.result)
-        }
-      }
-    }
-
-    return todos
-  } catch (error) {
-    $.ui.log(`statusbar: todos not replayed: ${describe(error)}`, { to: 'debug' })
-
-    return []
-  }
-}
-
-// 사용량 줄(좁으면 여러 줄) 아래에 git 줄, 그 아래에 할 일 줄을 둔다. 뒤의 두 줄은
-// 보일 것이 있을 때만 그린다.
+// 사용량 줄(좁으면 여러 줄) 아래에 git 줄을 둔다. git 줄은 저장소 안에서만 그린다.
 export function layoutRows(snapshot: StatusbarSnapshot, columns: number, frame?: Frame): Span[][] {
-  return [...usageRows(snapshot, columns, frame), ...gitRows(snapshot.git, columns), ...todoRows(snapshot, columns)]
+  return [...usageRows(snapshot, columns, frame), ...gitRows(snapshot.git, columns)]
 }
 
 function usageRows(snapshot: StatusbarSnapshot, columns: number, frame: Frame): Span[][] {
@@ -852,62 +702,6 @@ export function gitStatusText(git: Pick<StatusbarGit, 'changes' | 'upstream'>): 
     ...(ahead > 0 ? [`⇡${ahead}`] : []),
     ...(behind > 0 ? [`⇣${behind}`] : []),
   ].join('')
-}
-
-// 할 일 줄: 다 끝냈거나 비었으면 그리지 않는다. 넘치면 진행 중 항목 글자를 줄인다.
-function todoRows(snapshot: StatusbarSnapshot, columns: number): Span[][] {
-  const todos = todoProgress(snapshot.todos)
-  if (todos === undefined) return []
-  let row: Span[] = []
-  for (const textColumns of TODO_TEXT_COLUMNS) {
-    row = todoSpans(todos, textColumns)
-    if (widthOf(row) <= columns) return [row]
-  }
-
-  return [row]
-}
-
-// 사용량 줄의 미터처럼 라벨 T를 붙이고, 할 일 하나를 점 하나로 그린다: 끝냄 초록, 진행 중 주황, 남음 빈 점.
-function todoSpans(todos: TodoProgress, textColumns: number): Span[] {
-
-  return [
-    span('T ', { color: LABEL_COLORS.T ?? MUTED }),
-    ...todoDots(todos),
-    span(` ${todos.done}/${todos.total}`, { bold: true }),
-    ...(textColumns > 0 && todos.current !== undefined ? [span(`  ${fitText(todos.current, textColumns)}`)] : []),
-  ]
-}
-
-// 할 일이 MAX_TODO_DOTS개를 넘으면 그 개수의 점에 비율로 나눠 담는다.
-function todoDots({ done, active, total }: TodoProgress): Span[] {
-  const width = Math.min(total, MAX_TODO_DOTS)
-  const doneDots = Math.min(width, Math.round((done * width) / total))
-  const activeDots = active === 0 ? 0 : Math.min(width - doneDots, Math.max(1, Math.round((active * width) / total)))
-  const pendingDots = width - doneDots - activeDots
-
-  return [
-    ...(doneDots > 0 ? [span(EFFORT_ON.repeat(doneDots), { color: STATUS_COLORS.good })] : []),
-    ...(activeDots > 0 ? [span(EFFORT_ON.repeat(activeDots), { color: BRAND })] : []),
-    ...(pendingDots > 0 ? [span(EFFORT_OFF.repeat(pendingDots), { color: MUTED })] : []),
-  ]
-}
-
-type TodoProgress = { done: number; active: number; total: number; current?: string }
-
-// 다 끝냈거나 비었으면 undefined: 엔진처럼 목록을 감춘다. 진행 중인 항목은 activeForm으로 부른다.
-export function todoProgress(todos: readonly StatusbarTodo[] | undefined): TodoProgress | undefined {
-  if (todos === undefined || todos.length === 0) return undefined
-  const done = todos.filter(todo => todo.status === 'completed').length
-  if (done === todos.length) return undefined
-  const running = todos.filter(todo => todo.status === 'in_progress')
-  const current = running[0]
-
-  return {
-    done,
-    active: running.length,
-    total: todos.length,
-    ...(current ? { current: current.activeForm ?? current.subject } : {}),
-  }
 }
 
 // 너비(칸)에 맞게 자르고 끝에 …을 붙인다. 한글은 두 칸으로 센다.

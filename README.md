@@ -22,7 +22,6 @@ Claude Code 프롬프트에서:
 ```
 ✻ Opus 5.5  ●●●○○ high · C ━━━━━━━─── 71%  715k/1M · S ━───────── 13%  ↻3h35m   W ━───────── 4%  ↻5d
 my-claude/fix-bar · worktree-fix-bar · !3+2?1⇡1
-T ●●●●○○○ 3/7  Running tests
 ```
 
 git 줄은 starship 프롬프트와 같은 기호와 색으로 그려 셸 프롬프트와 똑같이 보입니다.
@@ -41,10 +40,6 @@ git 줄 (저장소 안에서만)
 - HEAD가 떨어지면 브랜치 자리에 `(커밋)`, 리베이스·병합·체리픽·revert·bisect 중이면 브랜치 뒤에 `(REBASING)`처럼 표시
 - 파일을 바꾸는 도구가 끝날 때마다, 그리고 15초마다 다시 읽음. PR은 Claude Code의 PR 표시(`/config` Show PR status footer)를 씀
 
-할 일 줄 (할 일이 있을 때만)
-
-- 할 일(TodoWrite·Task 도구): `T` 뒤에 할 일 하나에 점 하나(초록 끝냄, 주황 진행 중, 빈 점 남음, 10개가 넘으면 비율로), 끝낸 수/전체 수, 지금 하는 일. 다 끝나면 사라짐
-- 좁은 터미널에서는 지금 하는 일을 줄이다가 개수만 남김
-- 서브에이전트는 Claude Code가 직접 보여 주므로 따로 그리지 않음
+서브에이전트와 할 일(Task)은 Claude Code가 직접 보여 주므로 따로 그리지 않습니다.
 
 테스트: `claude plugin test plugins/statusbar`

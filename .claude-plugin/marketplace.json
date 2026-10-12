@@ -7,7 +7,7 @@
     {
       "name": "statusbar",
       "source": "./plugins/statusbar",
-      "description": "프롬프트 아래 상태 줄: 모델·effort, 컨텍스트, 5시간·주간(Fable이면 Fable 주간) 사용 한도를 프로그레스 바로, git 상태, 할 일을 함께 표시"
+      "description": "프롬프트 아래 상태 줄: 모델·effort, 컨텍스트, 5시간·주간(Fable이면 Fable 주간) 사용 한도를 프로그레스 바로, git 상태를 함께 표시"
     }
   ],
   "description": "개인용 Claude Code 플러그인 마켓플레이스"
