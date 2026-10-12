@@ -8,12 +8,17 @@ import type {
   SessionRateLimit,
   SessionUsage,
   Timer,
+  ToolCallInput,
+  ToolCallResult,
   TurnStepInput,
 } from 'claude-code'
 
 import type {
   StatusbarEffort,
   StatusbarFable,
+  StatusbarGit,
+  StatusbarGitOperation,
+  StatusbarPullRequest,
   StatusbarSnapshot,
   StatusbarWindow,
 } from '../types'
@@ -30,11 +35,47 @@ const FABLE_IDLE_REFRESH_MS = 30 * 60_000
 const BACKOFF_MS = 5 * 60_000
 const BACKOFF_CAP_MS = 60 * 60_000
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max']
+// git은 파일을 바꾸는 도구가 끝날 때마다, 그리고 바깥(다른 터미널)에서 바꾼 것도 잡도록 주기적으로 읽는다.
+const GIT_TICK_MS = 30_000
+const GIT_TIMEOUT_MS = 10_000
+// PR 상태는 브랜치가 바뀌거나 푸시·PR 명령이 돌면 곧바로, 아니면 3분마다 gh로 다시 묻는다. GitHub가
+// 머지 가능 여부를 아직 계산하지 못했으면(UNKNOWN) 다음 git 확인(30초 주기) 때 다시 묻는다.
+const PR_REFRESH_MS = 3 * 60_000
+const PR_UNKNOWN_RETRY_MS = 20_000
+const PR_TIMEOUT_MS = 15_000
+// --head는 브랜치 이름만 맞춰 남의 포크에서 온 같은 이름의 PR도 준다: 넉넉히 받아 소유자로 거른다.
+const PR_LIST_LIMIT = 10
+const PR_FIELDS = 'number,url,state,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,headRepositoryOwner'
+const PR_COMMAND = /\b(?:gh\s+pr|git\s+push)\b/
+// 끝나면 git 상태를 다시 읽는 도구.
+const WATCHED_TOOLS = [
+  'Bash',
+  'Edit',
+  'Write',
+  'NotebookEdit',
+  'EnterWorktree',
+  'ExitWorktree',
+] as const
+// git 디렉터리에 남는 표시 파일로 진행 중인 작업을 알아본다.
+const GIT_OPERATIONS: readonly (readonly [string, StatusbarGitOperation])[] = [
+  ['rebase-merge', 'rebasing'],
+  ['rebase-apply', 'rebasing'],
+  ['MERGE_HEAD', 'merging'],
+  ['CHERRY_PICK_HEAD', 'cherry-picking'],
+  ['REVERT_HEAD', 'reverting'],
+  ['BISECT_LOG', 'bisecting'],
+]
 
 // 글자와 장식은 사용자의 테마(라이트·다크)를 따르는 테마 키로 쓴다.
 const BRAND = 'claude'
 const MUTED = 'inactive'
 const FAINT = 'subtle'
+// 한 글자 라벨이 서로 구분되도록 각자 테마 색을 입힌다. 그 밖의 라벨은 MUTED.
+const LABEL_COLORS: Readonly<Record<string, string>> = {
+  C: 'claude',
+  S: 'suggestion',
+  W: 'planMode',
+}
 // 바의 색은 남은 비율의 단계: 라이트·다크 양쪽에서 검증된 고정 상태 색이다.
 const STATUS_COLORS = {
   good: '#0ca30c',
@@ -72,6 +113,25 @@ const FALLBACK_COLUMNS = 120
 const MIN_COLUMNS = 20
 // 엔진의 힌트 줄과 상태 줄 사이의 빈 줄 수.
 const ROW_GAP = 0
+// git 줄은 셸 프롬프트(starship)와 같은 모양·색으로 그린다: 경로는 굵은 하늘색, 브랜치는 굵은
+// 회색, 상태는 노란색으로 붙여 쓴다(=충돌 $스태시 ×삭제 »이름 바꿈 !수정 +스테이징 ?추적 안 함
+// ⇡앞섬 ⇣뒤처짐). yellow·gray·green은 터미널 팔레트의 그 색이다.
+const PATH_COLOR = '#57C7FF'
+const BRANCH_COLOR = 'gray'
+const COMMIT_COLOR = 'green'
+const GIT_STATUS_COLOR = 'yellow'
+const MIN_BRANCH_COLUMNS = 12
+// PR 번호의 색이 곧 상태다: draft 회색, 머지할 수 있지만 승인 전이면 주황, 승인까지 끝났으면 초록,
+// 충돌·CI 실패·변경 요청으로 머지할 수 없으면 빨강. 병합된 PR은 보라, 닫힌 PR은 흐리게.
+export function pullRequestColor(pr: StatusbarPullRequest): string {
+  if (pr.state === 'merged') return 'merged'
+  if (pr.state === 'closed') return FAINT
+  if (pr.state === 'draft') return MUTED
+  if (pr.merge === 'conflict' || pr.checks === 'fail' || pr.review === 'changes') return STATUS_COLORS.critical
+  if (pr.review === 'approved' && pr.merge === 'clean' && pr.checks !== 'pending') return STATUS_COLORS.good
+
+  return STATUS_COLORS.serious
+}
 
 const snapshotAtom = atom({ plugin: 'statusbar', key: 'snapshot' } as const, null, {
   shape: 'v1',
@@ -99,13 +159,29 @@ type State = {
   isReducedMotion: boolean
   queue: Promise<void>
   isQueued: boolean
+  git: StatusbarGit | undefined
+  gitTicker: Timer | undefined
+  // 지금 브랜치의 PR을 찾는 열쇠(저장소 뿌리·origin 소유자·브랜치). 원격이 없거나 HEAD가 떨어지면 없다.
+  prKey: string | undefined
+  pr: { key: string; value?: StatusbarPullRequest; isMergeUnknown: boolean; fetchedAt: number } | undefined
+  isPrStale: boolean
+  isPrFetching: boolean
+  prRetryAt: number
+  prFailures: number
+  gitQueue: Promise<void>
+  isGitQueued: boolean
 }
+
+type GitReading = { root: string; remote: string | null; git: StatusbarGit }
+// PR을 찾을 브랜치와, 그 브랜치를 올린 저장소(origin)의 소유자.
+type PullRequestTarget = { key: string; branch: string; owner: string }
 
 // 애니메이션의 현재 칸. 움직임을 줄인 설정이면 undefined로 멈춘 모습을 그린다.
 type Frame = number | undefined
 
-export type SpanStyle = { color?: string; dimColor?: boolean; bold?: boolean }
-export type Span = { text: string; style?: SpanStyle }
+export type SpanStyle = { color?: string; dimColor?: boolean; bold?: boolean; underline?: boolean }
+// href가 있으면 그 글자들을 누르면 그 주소가 열리는 버튼으로 그린다.
+export type Span = { text: string; style?: SpanStyle; href?: string }
 
 type Variant = { rows: 'one' | 'two' | 'stack'; bar: number; extras: boolean }
 type ResetStyle = 'minutes' | 'hours'
@@ -143,6 +219,16 @@ export const register: Register = on => {
     isReducedMotion: false,
     queue: Promise.resolve(),
     isQueued: false,
+    git: undefined,
+    gitTicker: undefined,
+    prKey: undefined,
+    pr: undefined,
+    isPrStale: false,
+    isPrFetching: false,
+    prRetryAt: 0,
+    prFailures: 0,
+    gitQueue: Promise.resolve(),
+    isGitQueued: false,
   }
 
   on('session.start', async ($, e, next) => {
@@ -151,15 +237,21 @@ export const register: Register = on => {
       // 0.1.0이 고정해 둔 한 줄짜리 상태줄을 걷어 낸다.
       $.ui.status(undefined)
       await restore($, state)
+      if (state.effort.kind === 'unknown') state.effort = await configuredEffort($)
       state.isReducedMotion = await prefersReducedMotion($)
-      state.ticker?.cancel()
-      state.ticker = $.clock.every(TICK_MS, () => void refresh($, state))
-      syncAnimation($, state)
-      schedule($, state)
+      startLive($, state)
     }
 
     return next(e)
   })
+
+  // 도구의 결과는 손대지 않고 그대로 돌려준다: 파일을 바꾼 도구가 끝나면 git 상태를 다시 읽는다.
+  on('tool.call', { tool: WATCHED_TOOLS }, async ($, e, next) => {
+    const result = await next(e)
+    if (state.isLive) noteTool($, state, e, result)
+
+    return result
+  }).catch(($, e, next) => next(e))
 
   on('session.measure', ($, e, next) => {
     state.isUsedSinceFetch = true
@@ -176,19 +268,23 @@ export const register: Register = on => {
     return yield* next(e)
   })
 
-  // /effort(선택 창 포함)의 결과 줄은 대화에 명령 출력으로 쌓인다: 다음 요청 전에 바로 반영한다.
+  // /effort·/model(선택 창 포함)의 결과 줄은 대화에 명령 출력으로 쌓인다: 다음 요청 전에
+  // 바로 반영한다. 사용자 플러그인의 classic.PostModelSwitch는 기본 보안 플러그인이
+  // 건너뛰므로 모델 전환도 이 줄로 알아챈다.
   on('session.append', { door: ['command', 'notice'] }, ($, e, next) => {
-    const level = effortFrom(textOfBlocks(e.message.content))
-    if (level !== undefined) noteEffort($, state, { kind: 'level', level })
+    const text = textOfBlocks(e.message.content)
+    const level = effortFrom(text)
+    if (isModelSwitch(text)) {
+      $.clock.after(0, () => void switchModel($, state, undefined, level))
+    } else if (level !== undefined) {
+      noteEffort($, state, { kind: 'level', level })
+    }
 
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  on('classic.PostModelSwitch', ($, e, next) => {
-    state.effort = { kind: 'unknown' }
-    if (isFable(e.to_model)) state.isFableRequested = true
-    syncAnimation($, state)
-    schedule($, state)
+  on('classic.PostModelSwitch', async ($, e, next) => {
+    await switchModel($, state, e.to_model)
 
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -198,27 +294,80 @@ export const register: Register = on => {
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
     const own = await next(e)
     const snapshot = await read($, snapshotAtom)
-    if (snapshot === null) return own
-    const { Box, Text } = $.ui.resolve(e)
+    if (snapshot === null) {
+      // /clear는 새 세션 id로 넘어가며 세션의 $.state를 비우지만 session.start는 다시
+      // 부르지 않고, 사용자 플러그인의 classic.SessionStart는 기본 보안 플러그인이 건너뛴다.
+      // 그래서 이미 쓴 스냅숏이 비어 읽히면 그리기 밖(타이머)에서 다시 세운다.
+      if (state.isLive && state.published !== undefined) {
+        state.published = undefined
+        $.clock.after(0, () => startLive($, state))
+      }
+
+      return own
+    }
+    const { Box, Text, Button } = $.ui.resolve(e)
     const columns = Math.max(MIN_COLUMNS, (e.viewport?.columns ?? FALLBACK_COLUMNS) - FOOTER_INSET)
-    const frame = state.isReducedMotion ? undefined : Math.floor((await $.clock.now()) / FRAME_MS)
+    const now = await $.clock.now()
+    const frame = state.isReducedMotion ? undefined : Math.floor(now / FRAME_MS)
+    const draw = (part: Span) =>
+      part.style === undefined ? part.text : <Text {...part.style}>{part.text}</Text>
+    // href가 있는 조각은 누르면 그 주소를 브라우저로 여는 버튼이다. 링크(OSC 8)는 터미널에 따라
+    // 주소를 글자로 덧붙이므로 쓰지 않는다. 버튼은 Text 안에 못 들어가 그런 줄은 가로 Box로 그린다.
+    const drawRow = (row: Span[]) => {
+      const runs = linkRuns(row)
+      if (runs.every(run => run.href === undefined)) return <Text wrap="truncate-end">{row.map(draw)}</Text>
+
+      return (
+        <Box flexDirection="row">
+          {runs.map(run => {
+            const { href } = run
+            if (href === undefined) return <Text>{run.parts.map(draw)}</Text>
+
+            return (
+              <Button plain key={`open:${href}`} onPress={() => void openPage($, href)}>
+                {run.parts.map(draw)}
+              </Button>
+            )
+          })}
+        </Box>
+      )
+    }
 
     // 엔진의 힌트 줄 아래 ROW_GAP 줄을 띄우고 상태 줄을 그린다.
     return (
       <Box flexDirection="column">
         {own}
         <Box flexDirection="column" marginTop={ROW_GAP}>
-          {layoutRows(snapshot, columns, frame).map(row => (
-            <Text wrap="truncate-end">
-              {row.map(part =>
-                part.style === undefined ? part.text : <Text {...part.style}>{part.text}</Text>,
-              )}
-            </Text>
-          ))}
+          {layoutRows(snapshot, columns, frame).map(drawRow)}
         </Box>
       </Box>
     )
   })
+}
+
+// 주소를 기본 브라우저로 연다: macOS는 open, 그 밖은 xdg-open.
+async function openPage($: EngineInterface, url: string): Promise<void> {
+  for (const opener of ['open', 'xdg-open']) {
+    try {
+      const { exitCode } = await $.process.run([opener, url])
+      if (exitCode === 0) return
+    } catch {
+      // 다음 방법으로 넘어간다.
+    }
+  }
+  $.ui.log(`statusbar: could not open ${url}`, { to: 'debug' })
+}
+
+// 이어진 조각을 href별로 묶는다: 같은 href끼리, href 없는 것끼리.
+function linkRuns(row: readonly Span[]): { href?: string; parts: Span[] }[] {
+  const runs: { href?: string; parts: Span[] }[] = []
+  for (const part of row) {
+    const last = runs.at(-1)
+    if (last !== undefined && last.href === part.href) last.parts.push(part)
+    else runs.push(part.href === undefined ? { parts: [part] } : { href: part.href, parts: [part] })
+  }
+
+  return runs
 }
 
 async function restore($: EngineInterface, state: State): Promise<void> {
@@ -228,6 +377,62 @@ async function restore($: EngineInterface, state: State): Promise<void> {
   state.effort = previous.effort
   if (previous.fable !== undefined) state.fable = previous.fable
   if (previous.fableFetchedAt !== undefined) state.lastFetchedAt = previous.fableFetchedAt
+  if (previous.git !== undefined) state.git = previous.git
+}
+
+// 타이머를 새로 걸고 스냅숏을 다시 쓴다. 몇 번 불러도 같은 모습이 된다.
+function startLive($: EngineInterface, state: State): void {
+  state.ticker?.cancel()
+  state.ticker = $.clock.every(TICK_MS, () => void refresh($, state))
+  state.gitTicker?.cancel()
+  state.gitTicker = $.clock.every(GIT_TICK_MS, () => void refreshGit($, state))
+  state.animator?.cancel()
+  state.animator = undefined
+  syncAnimation($, state)
+  state.published = undefined
+  schedule($, state)
+  $.clock.after(0, () => void refreshGit($, state))
+}
+
+// 첫 요청 전에는 보낼 effort를 알 길이 없으므로 엔진이 읽는 설정에서 미리 짐작한다:
+// 환경 변수 → 모델별 설정(modelSettings) → effortLevel. 첫 요청이 실제 값으로 고친다.
+async function configuredEffort($: EngineInterface, model?: string): Promise<StatusbarEffort> {
+  try {
+    const [fromEnv, settings, current] = await Promise.all([
+      $.env.get('CLAUDE_CODE_EFFORT_LEVEL'),
+      $.settings.read(),
+      model === undefined ? $.session.model() : Promise.resolve(model),
+    ])
+    const modelSettings = isRecord(settings.modelSettings) ? settings.modelSettings[current] : undefined
+    const perModel = isRecord(modelSettings) ? modelSettings.effortLevel : undefined
+    const level = [fromEnv, perModel, settings.effortLevel].find(
+      (value): value is string => typeof value === 'string' && EFFORT_LEVELS.includes(value),
+    )
+
+    return level === undefined ? { kind: 'unknown' } : { kind: 'level', level }
+  } catch (error) {
+    $.ui.log(`statusbar: effort setting not read: ${describe(error)}`, { to: 'debug' })
+
+    return { kind: 'unknown' }
+  }
+}
+
+// 바뀐 모델의 effort는 설정에서 다시 짐작한다. 같은 줄이 effort도 정했으면 그 값을 쓴다.
+async function switchModel(
+  $: EngineInterface,
+  state: State,
+  model?: string,
+  level?: string,
+): Promise<void> {
+  try {
+    const current = model ?? (await $.session.model())
+    state.effort = level === undefined ? await configuredEffort($, current) : { kind: 'level', level }
+    if (isFable(current)) state.isFableRequested = true
+    syncAnimation($, state)
+    schedule($, state)
+  } catch (error) {
+    $.ui.log(`statusbar: model switch not noted: ${describe(error)}`, { to: 'debug' })
+  }
 }
 
 function noteStepEffort($: EngineInterface, state: State, effort: TurnStepInput['effort']): void {
@@ -298,15 +503,17 @@ async function runRefresh($: EngineInterface, state: State): Promise<void> {
 }
 
 async function publish($: EngineInterface, state: State) {
-  const [model, usage, now] = await Promise.all([
+  const [model, usage, now, current] = await Promise.all([
     $.session.model(),
     $.session.usage(),
     $.clock.now(),
+    read($, snapshotAtom),
   ])
   const snapshot = snapshotOf(state, model, usage, now)
-  // 카운트다운은 분 단위라 같은 분 안에서는 다시 쓰지 않는다.
+  // 카운트다운은 분 단위라 같은 분 안에서는 다시 쓰지 않는다. 다만 /clear로 스냅숏이
+  // 비었으면 같은 값이라도 다시 쓴다(신호보다 비우기가 늦어도 다음 갱신이 되살린다).
   const key = JSON.stringify({ ...snapshot, now: Math.floor(now / 60_000) })
-  if (key !== state.published) {
+  if (key !== state.published || current === null) {
     state.published = key
     await update($, snapshotAtom, () => snapshot)
   }
@@ -323,6 +530,8 @@ function snapshotOf(
   const fiveHour = pickWindow(usage.rateLimits, 'five_hour') ?? state.seed.fiveHour
   const sevenDay = pickWindow(usage.rateLimits, 'seven_day') ?? state.seed.sevenDay
 
+  const git = gitOf(state)
+
   return {
     model,
     effort: state.effort,
@@ -332,6 +541,7 @@ function snapshotOf(
     ...(sevenDay ? { sevenDay } : {}),
     ...(state.hasPlan ? { fable: state.fable } : {}),
     ...(Number.isFinite(state.lastFetchedAt) ? { fableFetchedAt: state.lastFetchedAt } : {}),
+    ...(git ? { git } : {}),
   }
 }
 
@@ -392,7 +602,264 @@ async function fetchPlanUsage($: EngineInterface, state: State, now: number): Pr
   }
 }
 
+function refreshGit($: EngineInterface, state: State): Promise<void> {
+  if (!state.isLive) return Promise.resolve()
+  if (state.isGitQueued) return state.gitQueue
+  state.isGitQueued = true
+  state.gitQueue = state.gitQueue.then(() => {
+    state.isGitQueued = false
+
+    return runGitRefresh($, state)
+  })
+
+  return state.gitQueue
+}
+
+// 지금 브랜치의 PR을 찾았으면 git 값에 붙인다.
+function gitOf(state: State): StatusbarGit | undefined {
+  const { git, pr, prKey } = state
+  if (git === undefined || prKey === undefined || pr?.key !== prKey || pr.value === undefined) return git
+
+  return { ...git, pr: pr.value }
+}
+
+async function runGitRefresh($: EngineInterface, state: State): Promise<void> {
+  try {
+    const [reading, now] = await Promise.all([readGit($), $.clock.now()])
+    const target = pullRequestTargetOf(reading)
+    // 다른 터미널에서 push·pull해도 upstream과의 차이(⇡⇣)가 바뀌므로 PR 상태를 곧바로 다시 묻는다.
+    const previous = state.git
+    if (previous !== undefined && JSON.stringify(previous.upstream) !== JSON.stringify(reading?.git.upstream)) {
+      state.isPrStale = true
+      state.prRetryAt = 0
+    }
+    state.git = reading?.git
+    state.prKey = target?.key
+    if (target !== undefined && isPullRequestDue(state, now)) {
+      void fetchPullRequest($, state, target, now).then(() => schedule($, state))
+    }
+    schedule($, state)
+  } catch (error) {
+    // 잠깐의 실패(시간 초과 등)로 줄이 깜빡이지 않도록 마지막 값을 둔다.
+    $.ui.log(`statusbar: git status not read: ${describe(error)}`, { to: 'debug' })
+  }
+}
+
+// 저장소 밖이거나 git이 상태를 못 읽으면 undefined: git 줄을 그리지 않는다. 다른 git 명령과
+// index.lock을 다투지 않도록 선택적 잠금을 끄고 읽는다.
+async function readGit($: EngineInterface): Promise<GitReading | undefined> {
+  const repo = await $.session.repo()
+  if (repo === null) return undefined
+  const [status, paths] = await Promise.all([
+    readStatus($),
+    runGit($, ['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir', '--show-toplevel']).catch(
+      () => undefined,
+    ),
+  ])
+  if (status === undefined) return undefined
+  const [gitDir = '', commonDir = '', top = ''] = (paths ?? '').split('\n')
+  // 연결된 워크트리는 자기 git 디렉터리가 공용 디렉터리와 다르다.
+  const isWorktree = gitDir !== '' && commonDir !== '' && top !== '' && gitDir !== commonDir
+  const operation = gitDir === '' ? undefined : await operationIn($, gitDir)
+
+  return {
+    root: repo.root,
+    remote: repo.remote,
+    git: {
+      project: baseName(repo.root),
+      ...(isWorktree ? { worktree: baseName(top) } : {}),
+      ...(operation !== undefined ? { operation } : {}),
+      ...gitStatusOf(status),
+    },
+  }
+}
+
+// 원격이 있고 브랜치 위에 있을 때만 PR을 찾는다.
+function pullRequestTargetOf(reading: GitReading | undefined): PullRequestTarget | undefined {
+  const branch = reading?.git.branch
+  const owner = remoteOwner(reading?.remote ?? null)
+  if (reading === undefined || branch === undefined || owner === undefined) return undefined
+
+  return { key: `${reading.root}\n${owner}\n${branch}`, branch, owner }
+}
+
+// https://github.com/<owner>/<repo>.git, git@github.com:<owner>/<repo>.git, ssh://git@host/<owner>/<repo>.
+export function remoteOwner(remote: string | null): string | undefined {
+  const match = remote === null ? null : /[/:]([^/:]+)\/[^/:]+?(?:\.git)?\/?$/.exec(remote)
+
+  return match?.[1]
+}
+
+function isPullRequestDue(state: State, now: number): boolean {
+  const { prKey, pr } = state
+  if (prKey === undefined || state.isPrFetching || now < state.prRetryAt) return false
+  if (pr?.key !== prKey || state.isPrStale) return true
+
+  return now - pr.fetchedAt >= (pr.isMergeUnknown ? PR_UNKNOWN_RETRY_MS : PR_REFRESH_MS)
+}
+
+// 지금 브랜치를 head로 하고 그 head가 origin 소유자의 것인 PR 가운데 가장 최근 것(닫힌 것·병합된
+// 것 포함). gh가 없거나 로그인 전이거나 GitHub 저장소가 아니면 실패로 보고 물러났다가 다시 묻는다.
+async function fetchPullRequest($: EngineInterface, state: State, target: PullRequestTarget, now: number): Promise<void> {
+  state.isPrFetching = true
+  state.isPrStale = false
+  try {
+    const { exitCode, stdout, stderr } = await $.process.run(
+      ['gh', 'pr', 'list', '--head', target.branch, '--state', 'all', '--limit', String(PR_LIST_LIMIT), '--json', PR_FIELDS],
+      { timeoutMs: PR_TIMEOUT_MS, env: { GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' } },
+    )
+    if (exitCode !== 0) throw new Error(stderr.trim().split('\n')[0] || `gh exited ${exitCode}`)
+    const row = ownRow(JSON.parse(stdout), target.owner)
+    const value = row === undefined ? undefined : pullRequestOf(row)
+    state.pr = {
+      key: target.key,
+      fetchedAt: now,
+      isMergeUnknown: row?.state === 'OPEN' && row.mergeable === 'UNKNOWN',
+      ...(value ? { value } : {}),
+    }
+    state.prFailures = 0
+    state.prRetryAt = 0
+  } catch (error) {
+    state.prFailures += 1
+    state.prRetryAt = now + Math.min(BACKOFF_MS * 2 ** (state.prFailures - 1), BACKOFF_CAP_MS)
+    $.ui.log(`statusbar: pull request not read: ${describe(error)}`, { to: 'debug' })
+  } finally {
+    state.isPrFetching = false
+  }
+}
+
+function ownRow(rows: unknown, owner: string): Json | undefined {
+  return (Array.isArray(rows) ? rows.filter(isRecord) : []).find(row => {
+    const head = row.headRepositoryOwner
+
+    return isRecord(head) && typeof head.login === 'string' && head.login.toLowerCase() === owner.toLowerCase()
+  })
+}
+
+// `gh pr list --json`의 한 줄을 상태로 줄인다.
+export function pullRequestOf(row: Json): StatusbarPullRequest | undefined {
+  const state =
+    row.state === 'MERGED' ? 'merged' : row.state === 'CLOSED' ? 'closed' : row.state === 'OPEN' ? (row.isDraft === true ? 'draft' : 'open') : undefined
+  if (state === undefined || typeof row.number !== 'number' || typeof row.url !== 'string') return undefined
+  const base: StatusbarPullRequest = { number: row.number, url: row.url, state }
+  if (state === 'merged' || state === 'closed') return base
+  const merge =
+    row.mergeable === 'CONFLICTING' || row.mergeStateStatus === 'DIRTY'
+      ? 'conflict'
+      : row.mergeStateStatus === 'BEHIND'
+        ? 'behind'
+        : row.mergeStateStatus === 'CLEAN' || row.mergeStateStatus === 'HAS_HOOKS'
+          ? 'clean'
+          : undefined
+  const checks = checksOf(row.statusCheckRollup)
+  const review =
+    row.reviewDecision === 'APPROVED'
+      ? 'approved'
+      : row.reviewDecision === 'CHANGES_REQUESTED'
+        ? 'changes'
+        : row.reviewDecision === 'REVIEW_REQUIRED'
+          ? 'required'
+          : undefined
+
+  return { ...base, ...(merge ? { merge } : {}), ...(checks ? { checks } : {}), ...(review ? { review } : {}) }
+}
+
+// 검사 하나라도 실패면 실패, 아니면 하나라도 도는 중이면 진행 중, 모두 끝나 통과면 통과.
+function checksOf(rollup: unknown): StatusbarPullRequest['checks'] {
+  const results = (Array.isArray(rollup) ? rollup.filter(isRecord) : []).map(check => {
+    // CheckRun은 status·conclusion, StatusContext는 state를 준다.
+    const value = String(check.conclusion ?? check.state ?? '')
+    if (check.status !== undefined && check.status !== 'COMPLETED') return 'pending'
+    if (['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(value)) return 'pass'
+    if (['PENDING', 'EXPECTED', 'QUEUED', 'IN_PROGRESS', ''].includes(value)) return 'pending'
+
+    return 'fail'
+  })
+  if (results.length === 0) return undefined
+  if (results.includes('fail')) return 'fail'
+
+  return results.includes('pending') ? 'pending' : 'pass'
+}
+
+// 스태시 수(--show-stash)는 git 2.35부터라 그 전 git이면 빼고 다시 읽는다.
+async function readStatus($: EngineInterface): Promise<string | undefined> {
+  const args = ['status', '--porcelain=v2', '--branch']
+
+  return (await runGit($, [...args, '--show-stash'])) ?? (await runGit($, args))
+}
+
+async function runGit($: EngineInterface, args: readonly string[]): Promise<string | undefined> {
+  const { exitCode, stdout } = await $.process.run(['git', '--no-optional-locks', ...args], {
+    timeoutMs: GIT_TIMEOUT_MS,
+  })
+
+  return exitCode === 0 ? stdout : undefined
+}
+
+// 워크트리의 git 디렉터리는 작업 폴더 밖이라 파일 접근이 막힐 수 있다: 그때는 진행 중 표시만 뺀다.
+async function operationIn($: EngineInterface, gitDir: string): Promise<StatusbarGitOperation | undefined> {
+  try {
+    const found = await Promise.all(GIT_OPERATIONS.map(([marker]) => $.fs.exists(`${gitDir}/${marker}`)))
+
+    return GIT_OPERATIONS.find((_, index) => found[index] === true)?.[1]
+  } catch {
+    return undefined
+  }
+}
+
+// `git status --porcelain=v2 --branch --show-stash`를 starship의 git_status처럼 센다. 각 항목의 XY는
+// 스테이징(X)과 작업 트리(Y)의 상태다.
+export function gitStatusOf(text: string): Omit<StatusbarGit, 'project' | 'worktree' | 'operation'> {
+  const changes = { conflicted: 0, stashed: 0, deleted: 0, renamed: 0, modified: 0, staged: 0, untracked: 0 }
+  let oid = ''
+  let head = ''
+  let upstream: StatusbarGit['upstream']
+  for (const line of text.split('\n')) {
+    const ab = /^# branch\.ab \+(\d+) -(\d+)$/.exec(line)
+    const stash = /^# stash (\d+)$/.exec(line)
+    const xy = line.slice(2, 4)
+    if (line.startsWith('# branch.oid ')) oid = line.slice('# branch.oid '.length)
+    else if (line.startsWith('# branch.head ')) head = line.slice('# branch.head '.length)
+    else if (ab) upstream = { ahead: Number(ab[1]), behind: Number(ab[2]) }
+    else if (stash) changes.stashed = Number(stash[1])
+    else if (line.startsWith('1 ') || line.startsWith('2 ')) {
+      if (line.startsWith('2 ')) changes.renamed += 1
+      if (xy.includes('D')) changes.deleted += 1
+      if (xy[1] === 'M' || xy[1] === 'A') changes.modified += 1
+      if (xy[0] === 'M' || xy[0] === 'A' || xy[0] === 'T') changes.staged += 1
+    } else if (line.startsWith('u ')) changes.conflicted += 1
+    else if (line.startsWith('? ')) changes.untracked += 1
+  }
+  const isDetached = head === '(detached)' || head === ''
+
+  return {
+    ...(isDetached ? { commit: oid.slice(0, 7) } : { branch: head }),
+    ...(upstream ? { upstream } : {}),
+    changes,
+  }
+}
+
+// 파일을 바꿨을 수 있는 도구(읽기 전용이 아닌 호출)가 끝나면 git 상태를 다시 읽는다. 푸시나 PR
+// 명령은 실패로 끝나도(gh가 GitHub 오류를 받고도 PR은 만들어짐) PR 상태를 곧바로 다시 묻는다.
+function noteTool($: EngineInterface, state: State, e: ToolCallInput, result: ToolCallResult): void {
+  const operation = isRecord(result.result) ? result.result.gitOperation : undefined
+  const touchesPr =
+    (e.tool === 'Bash' && PR_COMMAND.test(e.command)) ||
+    (isRecord(operation) && (operation.pr !== undefined || operation.push !== undefined))
+  if (touchesPr) {
+    state.isPrStale = true
+    state.prRetryAt = 0
+  }
+  const isWrite = result.deny === undefined && result.isError !== true && result.isReadOnly !== true
+  if (touchesPr || isWrite) $.clock.after(0, () => void refreshGit($, state))
+}
+
+// git 줄(저장소 안에서만) 아래에 사용량 줄(좁으면 여러 줄)을 둔다.
 export function layoutRows(snapshot: StatusbarSnapshot, columns: number, frame?: Frame): Span[][] {
+  return [...gitRows(snapshot.git, columns), ...usageRows(snapshot, columns, frame)]
+}
+
+function usageRows(snapshot: StatusbarSnapshot, columns: number, frame: Frame): Span[][] {
   let rows: Span[][] = []
   for (const variant of VARIANTS) {
     rows = composeRows(snapshot, variant, frame)
@@ -402,11 +869,98 @@ export function layoutRows(snapshot: StatusbarSnapshot, columns: number, frame?:
   return rows
 }
 
+// 셸 프롬프트처럼 이어 쓰고 · 로 나눈다: 프로젝트[/워크트리] · 브랜치 (진행 중 작업) · 상태 · PR 상태.
+// 넘치면 브랜치 이름을 줄이고, 그래도 넘치면 PR 상태를 뺀다.
+function gitRows(git: StatusbarGit | undefined, columns: number): Span[][] {
+  if (git === undefined) return []
+  const head = git.branch ?? git.commit ?? '?'
+  let row: Span[] = []
+  for (const hasPr of [true, false]) {
+    row = gitSpans(git, hasPr)
+    const overflow = widthOf(row) - columns
+    if (overflow <= 0) return [row]
+    row = gitSpans(git, hasPr, Math.max(MIN_BRANCH_COLUMNS, displayWidth(head) - overflow))
+    if (widthOf(row) <= columns) return [row]
+  }
+
+  return [row]
+}
+
+function gitSpans(git: StatusbarGit, hasPr: boolean, branchColumns = Number.POSITIVE_INFINITY): Span[] {
+  const place = git.worktree === undefined ? git.project : `${git.project}/${git.worktree}`
+  const status = gitStatusText(git)
+  const groups = [
+    [span(place, { color: PATH_COLOR, bold: true })],
+    [
+      // HEAD가 떨어지면 starship의 git_commit처럼 (커밋)을 브랜치 자리에 둔다.
+      git.branch === undefined
+        ? span(`(${git.commit ?? '?'})`, { color: COMMIT_COLOR, bold: true })
+        : span(fitText(git.branch, branchColumns), { color: BRANCH_COLOR, bold: true }),
+      ...(git.operation === undefined
+        ? []
+        : [span(` (${git.operation.toUpperCase()})`, { color: GIT_STATUS_COLOR, bold: true })]),
+    ],
+    status === '' ? [] : [span(status, { color: GIT_STATUS_COLOR })],
+    hasPr && git.pr !== undefined ? pullRequestSpans(git.pr) : [],
+  ]
+
+  return joinSpans(
+    groups.filter(group => group.length > 0),
+    [span(' '), span('·', { color: FAINT }), span(' ')],
+  )
+}
+
+// PR 번호만 상태 색으로 칠하고, 누르면 PR 페이지가 열린다.
+function pullRequestSpans(pr: StatusbarPullRequest): Span[] {
+  return [
+    span('PR ', { color: MUTED }, pr.url),
+    span(`#${pr.number}`, { color: pullRequestColor(pr), bold: true, underline: true }, pr.url),
+  ]
+}
+
+// starship의 $all_status$ahead_behind와 같은 순서·기호로 붙여 쓴다. 깨끗하고 upstream과 같으면 빈 글자.
+export function gitStatusText(git: Pick<StatusbarGit, 'changes' | 'upstream'>): string {
+  const { conflicted, stashed, deleted, renamed, modified, staged, untracked } = git.changes
+  const marks: readonly [number, string][] = [
+    [conflicted, '='],
+    [stashed, '$'],
+    [deleted, '×'],
+    [renamed, '»'],
+    [modified, '!'],
+    [staged, '+'],
+    [untracked, '?'],
+  ]
+  const ahead = git.upstream?.ahead ?? 0
+  const behind = git.upstream?.behind ?? 0
+
+  return [
+    ...marks.filter(([count]) => count > 0).map(([count, mark]) => `${mark}${count}`),
+    ...(ahead > 0 ? [`⇡${ahead}`] : []),
+    ...(behind > 0 ? [`⇣${behind}`] : []),
+  ].join('')
+}
+
+// 너비(칸)에 맞게 자르고 끝에 …을 붙인다. 한글은 두 칸으로 센다.
+export function fitText(text: string, columns: number): string {
+  if (displayWidth(text) <= columns) return text
+  if (columns < 1) return ''
+  let kept = ''
+  let width = 0
+  for (const char of text) {
+    const next = width + displayWidth(char)
+    if (next > columns - 1) break
+    kept += char
+    width = next
+  }
+
+  return `${kept}…`
+}
+
 function composeRows(snapshot: StatusbarSnapshot, variant: Variant, frame: Frame): Span[][] {
   const head = headSpans(snapshot, frame)
   const context = contextMeter(snapshot, variant)
   const limits = limitMeters(snapshot, variant)
-  const separator = [span('  '), span('│', { color: FAINT }), span('  ')]
+  const separator = [span(' '), span('·', { color: FAINT }), span(' ')]
   const joined = joinSpans(limits, [span('   ')])
   const rows =
     variant.rows === 'one'
@@ -467,17 +1021,17 @@ function painterFor(level: string, length: number, frame: Frame): (index: number
 function contextMeter(snapshot: StatusbarSnapshot, variant: Variant): Span[] {
   const { tokens, window, percent } = snapshot.context
   const size = window > 0 ? formatTokens(window) : '?'
-  if (tokens === undefined) return meter('ctx', 0, MUTED, '—', `—/${size}`, variant)
+  if (tokens === undefined) return meter('C', 0, MUTED, '—', `—/${size}`, variant)
   const used = Math.round(percent ?? (window > 0 ? (tokens / window) * 100 : 0))
 
-  return usageMeter('ctx', used, `${formatTokens(tokens)}/${size}`, variant)
+  return usageMeter('C', used, `${formatTokens(tokens)}/${size}`, variant)
 }
 
 function limitMeters(snapshot: StatusbarSnapshot, variant: Variant): Span[][] {
   const { fiveHour, sevenDay, fable, now } = snapshot
   const meters: Span[][] = []
-  if (fiveHour) meters.push(windowMeter('5h', fiveHour, now, variant, 'minutes'))
-  if (sevenDay) meters.push(windowMeter('주간', sevenDay, now, variant, 'hours'))
+  if (fiveHour) meters.push(windowMeter('S', fiveHour, now, variant, 'minutes'))
+  if (sevenDay) meters.push(windowMeter('W', sevenDay, now, variant, 'hours'))
   if (fable && isFable(snapshot.model)) {
     if (fable.kind === 'unknown') meters.push(meter('Fable', 0, MUTED, '?', undefined, variant))
     if (fable.kind === 'absent') meters.push(meter('Fable', 0, MUTED, '—', undefined, variant))
@@ -532,7 +1086,7 @@ function meter(
   const filled = ratio <= 0 ? 0 : Math.min(width, Math.max(1, Math.round(ratio * width)))
 
   return [
-    span(`${label} `, { color: MUTED }),
+    span(`${label} `, { color: LABEL_COLORS[label] ?? MUTED }),
     span(FILLED.repeat(filled), { color }),
     span(TRACK.repeat(width - filled), { color, dimColor: true }),
     span(` ${value}`, { bold: true }),
@@ -541,8 +1095,8 @@ function meter(
   ]
 }
 
-function span(text: string, style?: SpanStyle): Span {
-  return style === undefined ? { text } : { text, style }
+function span(text: string, style?: SpanStyle, href?: string): Span {
+  return { text, ...(style !== undefined ? { style } : {}), ...(href !== undefined ? { href } : {}) }
 }
 
 function joinSpans(groups: readonly Span[][], separator: readonly Span[]): Span[] {
@@ -627,6 +1181,11 @@ export function effortFrom(text: string | undefined): string | undefined {
   const level = match?.[1]?.toLowerCase()
 
   return level !== undefined && EFFORT_LEVELS.includes(level) ? level : undefined
+}
+
+// /model이 남기는 문장: "Set model to `Sonnet 5.5` and saved as your default for new sessions".
+export function isModelSwitch(text: string): boolean {
+  return /\bset model to\b/i.test(text)
 }
 
 function textOfBlocks(blocks: readonly ApiContentBlock[]): string {
@@ -719,6 +1278,10 @@ function modelNameOf(row: Json): string | undefined {
 
 function isRecord(value: unknown): value is Json {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function baseName(path: string): string {
+  return path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || path
 }
 
 function capitalize(word = ''): string {

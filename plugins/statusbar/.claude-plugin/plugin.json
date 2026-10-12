@@ -1,7 +1,7 @@
 {
   "name": "statusbar",
-  "version": "0.4.0",
-  "description": "프롬프트 아래 상태 줄: 모델·effort, 컨텍스트와 사용 한도(5시간·주간, Fable 모델이면 Fable 주간 한도)의 사용률을 남은 비율에 따라 색이 바뀌는 프로그레스 바로 표시",
+  "version": "0.5.0",
+  "description": "프롬프트 아래 상태 줄: 모델·effort, 컨텍스트와 사용 한도(5시간·주간, Fable 모델이면 Fable 주간 한도)의 사용률을 남은 비율에 따라 색이 바뀌는 프로그레스 바로 표시하고, git 줄(프로젝트·브랜치·워크트리·변경·upstream)을 덧붙임",
   "types": "./types/index.d.ts",
   "author": {
     "name": "DevooKim"

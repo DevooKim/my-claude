@@ -10,15 +10,21 @@ import type {
   TurnStepInput,
 } from 'claude-code'
 
-import type { StatusbarSnapshot } from '../types'
+import type { StatusbarGit, StatusbarSnapshot } from '../types'
 import {
   displayWidth,
   effortFrom,
   effortSpans,
   fableOf,
+  fitText,
   formatTokens,
+  gitStatusOf,
+  gitStatusText,
   layoutRows,
   prettyModel,
+  pullRequestColor,
+  pullRequestOf,
+  remoteOwner,
   resetIn,
   statusOf,
 } from '../hooks/register'
@@ -36,8 +42,43 @@ const HEADER_LIMITS: SessionRateLimit[] = [
   { kind: 'seven_day', percentUsed: 42, resetsAt: WEEK_RESET },
 ]
 
-const LIMITS = '5h ━━━─────── 28%  ↻2h13m   주간 ━━━━────── 42%  ↻3d'
-const OPUS_ROW = `✻ Opus 5.5  effort ?  │  ctx ━━──────── 23%  46k/200k  │  ${LIMITS}`
+const LIMITS = 'S ━━━─────── 28%  ↻2h13m   W ━━━━────── 42%  ↻3d'
+const OPUS_ROW = `✻ Opus 5.5  effort ? · C ━━──────── 23%  46k/200k · ${LIMITS}`
+
+const ROOT = '/work/my-claude'
+const REMOTE = 'https://github.com/DevooKim/my-claude.git'
+const OID = '1234567890abcdef1234567890abcdef12345678'
+const porcelain = (...lines: string[]) => `${lines.join('\n')}\n`
+// gh pr list의 한 줄. 소유자가 다르면 같은 이름의 브랜치로 남의 포크에서 연 PR이다.
+const PR_URL = 'https://github.com/DevooKim/my-claude/pull/1'
+const prRow = (fields: Record<string, unknown>, login = 'DevooKim') => ({
+  number: 1,
+  url: PR_URL,
+  state: 'OPEN',
+  isDraft: false,
+  mergeable: 'MERGEABLE',
+  mergeStateStatus: 'CLEAN',
+  reviewDecision: '',
+  statusCheckRollup: [],
+  headRepositoryOwner: { id: `U_${login}`, login },
+  ...fields,
+})
+const CHECK = (conclusion: string, status = 'COMPLETED') => ({ __typename: 'CheckRun', name: 'ci', status, conclusion })
+const GH_ARGS = ['--state', 'all', '--limit', '10', '--json', 'number,url,state,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,headRepositoryOwner']
+// 스테이징 2(M., MM), 수정 2(.M, MM), 추적 안 함 3, upstream보다 2 앞서고 1 뒤처짐.
+const FEATURE_STATUS = porcelain(
+  `# branch.oid ${OID}`,
+  '# branch.head feature/bar',
+  '# branch.upstream origin/feature/bar',
+  '# branch.ab +2 -1',
+  '1 M. N... 100644 100644 100644 aaa bbb hooks/register.tsx',
+  '1 .M N... 100644 100644 100644 aaa bbb README.md',
+  '1 MM N... 100644 100644 100644 aaa bbb types/index.d.ts',
+  '? notes.md',
+  '? scratch/',
+  '? todo.txt',
+)
+
 
 const usageOf = (rateLimits: SessionRateLimit[], tokens?: number): SessionUsage => ({
   startedAt: NOW,
@@ -69,12 +110,22 @@ const usageBody = (fablePercent: number) =>
 
 type Answer = { status: number; text: string; headers?: Record<string, string> }
 
+// 세션이 선 저장소: git status의 출력, rev-parse의 세 경로, git 디렉터리에 있는 표시 파일.
+type Repo = { root: string; remote: string | null; status: string; paths?: string; markers?: string[] }
+
 type World = {
   model: string
   usage: SessionUsage
   auth: SessionAuthorization
   answers: Answer[]
   isReducedMotion: boolean
+  settings: Record<string, unknown>
+  env: Record<string, string>
+  repo?: Repo
+  isFsRefused: boolean
+  bash: Record<string, unknown>
+  prs: unknown[]
+  isBashFailing: boolean
 }
 
 function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
@@ -83,6 +134,12 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
     auth: { handle: 'auth_test', kind: 'bearer' },
     answers: [],
     isReducedMotion: false,
+    settings: {},
+    env: {},
+    isFsRefused: false,
+    bash: { stdout: '', stderr: '', interrupted: false },
+    prs: [],
+    isBashFailing: false,
     ...initial,
   }
   const fetches: { url: string; auth?: string; beta?: string }[] = []
@@ -91,6 +148,18 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.measure', ($, e) => ({ changed: e.changed }))
   on('classic.PostModelSwitch', () => ({}))
+  // /clear가 세션의 상태를 비운 모습: 플러그인이 다시 쓸 때까지 스냅숏은 비어 읽힌다.
+  const session = { isWiped: false, wipe: () => void (session.isWiped = true) }
+  on('state.get', { plugin: 'statusbar', key: 'snapshot' }, async ($, e, next) => {
+    const held = await next(e)
+
+    return session.isWiped && held.value !== undefined ? { value: { ...held.value, value: undefined } } : held
+  })
+  on('state.set', { plugin: 'statusbar', key: 'snapshot' }, ($, e, next) => {
+    session.isWiped = false
+
+    return next(e)
+  })
   on('turn.step', async function* ($, e) {
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
   })
@@ -106,7 +175,8 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
   })
   on('ui.status', () => ({ value: undefined }))
   on('ui.log', () => ({ value: undefined }))
-  on('settings.read', () => ({ value: { prefersReducedMotion: world.isReducedMotion } }))
+  on('settings.read', () => ({ value: { ...world.settings, prefersReducedMotion: world.isReducedMotion } }))
+  on('env.get', ($, e) => ({ value: world.env[e.name] }))
   const redraws = { count: 0 }
   on('ui.invalidate', ($, e, next) => {
     redraws.count += 1
@@ -116,7 +186,40 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
   // 엔진 대신 힌트 줄을 그린다: 플러그인 트리는 이 줄을 그대로 품어야 한다.
   on('ui.render', () => ({ type: 'Box', children: [ENGINE_LINE] }))
 
-  return { world, fetches, clock, redraws }
+  // git과 gh: 저장소 밖이면 git은 128로 끝난다.
+  const runs: string[][] = []
+  on('process.run', ($, e) => {
+    runs.push([...e.argv])
+    const ran = (exitCode: number, stdout: string, stderr = '') => ({
+      value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false },
+    })
+    const [command, ...args] = e.argv
+    const { repo } = world
+    if (command === 'open') return ran(0, '')
+    if (command === 'gh') return ran(0, JSON.stringify(world.prs))
+    if (command === 'open') return ran(0, '')
+    if (command !== 'git' || repo === undefined) return ran(128, '', 'fatal: not a git repository')
+    if (args.includes('status')) return ran(0, repo.status)
+
+    return ran(0, repo.paths ?? `${repo.root}/.git\n${repo.root}/.git\n${repo.root}\n`)
+  })
+  on('session.repo', () => ({
+    value: world.repo === undefined ? null : { root: world.repo.root, remote: world.repo.remote, internal: false, name: null },
+  }))
+  // 작업 폴더 밖(워크트리의 git 디렉터리)을 막는 파일 가드가 있는 세션.
+  on('fs.exists', ($, e) =>
+    world.isFsRefused
+      ? { deny: 'outside the workspace' }
+      : { value: (world.repo?.markers ?? []).some(marker => e.path.endsWith(`/${marker}`)) },
+  )
+  // 도구는 엔진이 답하듯 기록을 돌려준다.
+  on('tool.call', () =>
+    world.isBashFailing
+      ? { isError: true as const, result: 'GraphQL: Something went wrong', text: 'GraphQL: Something went wrong' }
+      : { result: world.bash },
+  )
+
+  return { world, fetches, clock, redraws, session, runs }
 }
 
 const START = { cwd: '/work', surface: 'terminal', isInteractive: true } as const
@@ -138,11 +241,11 @@ async function step(
   while (chunk.done !== true) chunk = await stream.next()
 }
 
-// 프롬프트 아래 힌트 줄을 그려 줄마다의 글자를 돌려준다: 첫 줄은 엔진의 줄.
-async function footer(
+// 프롬프트 아래 힌트 줄을 플러그인을 거쳐 그린 트리.
+async function drawn(
   $: Engine,
   options: { columns?: number; surface?: RenderSurface } = {},
-): Promise<string[]> {
+): Promise<RenderElement> {
   const ui = await $.ui.mount({
     plugin: 'statusbar',
     surface: options.surface ?? 'terminal',
@@ -152,6 +255,16 @@ async function footer(
   })
   const tree = await ui.drawn()
   await ui.unmount()
+
+  return tree
+}
+
+// 프롬프트 아래 힌트 줄을 그려 줄마다의 글자를 돌려준다: 첫 줄은 엔진의 줄.
+async function footer(
+  $: Engine,
+  options: { columns?: number; surface?: RenderSurface } = {},
+): Promise<string[]> {
+  const tree = await drawn($, options)
   const children = 'children' in tree ? (tree.children ?? []) : []
   if (children.length === 1 && children[0] === ENGINE_LINE) return [ENGINE_LINE]
   const [own = '', rowsBox = ''] = children
@@ -195,12 +308,41 @@ describe('status line under the prompt', () => {
 
     await step($, { model: 'claude-opus-5-5', effort: 'max' })
     await clock.settle()
-    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●●● max  │  ctx ')
+    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●●● max · C ')
 
     // 서브에이전트의 요청은 메인의 effort를 바꾸지 않는다.
     await step($, { model: 'claude-haiku-5-5', effort: 'low', agentId: 'sub-1' })
     await clock.settle()
-    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●●● max  │')
+    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●●● max ·')
+  })
+
+  test('after /clear empties the session state the bar is drawn again at once', async ($, on) => {
+    const { clock, session } = setUp(on, { model: 'claude-opus-5-5' })
+
+    await $.session.start(START)
+    await step($, { model: 'claude-opus-5-5', effort: 'high' })
+    await clock.settle()
+    const before = await bar($)
+
+    // /clear: 세션의 상태가 비고 아무 신호 없이 힌트 줄만 다시 그려진다. 값은 그대로다.
+    session.wipe()
+    expect(await footer($)).toEqual([ENGINE_LINE])
+    await clock.settle()
+    expect(await bar($)).toEqual(before)
+    expect(before[0]).toStartWith('✻ Opus 5.5  ●●●○○ high ·')
+  })
+
+  test('an emptied snapshot is written again by the next refresh in the same minute', async ($, on) => {
+    const { clock, session, world } = setUp(on, { model: 'claude-opus-5-5' })
+
+    await $.session.start(START)
+    await clock.settle()
+    expect(await bar($)).toEqual([OPUS_ROW])
+
+    session.wipe()
+    await $.session.measure({ context: world.usage.context, rateLimits: HEADER_LIMITS, changed: ['context'] })
+    await clock.settle()
+    expect(await bar($)).toEqual([OPUS_ROW])
   })
 
   test('the /effort output row updates effort before the next request', async ($, on) => {
@@ -222,7 +364,30 @@ describe('status line under the prompt', () => {
       uuid: 'row-effort',
     })
     await clock.settle()
-    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●○○ high  │')
+    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●○○ high ·')
+  })
+
+  test('before the first request effort comes from the settings', async ($, on) => {
+    const { clock } = setUp(on, {
+      model: 'claude-opus-5-5',
+      settings: { effortLevel: 'low', modelSettings: { 'claude-opus-5-5': { effortLevel: 'high' } } },
+    })
+
+    await $.session.start(START)
+    await clock.settle()
+    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●○○ high ·')
+  })
+
+  test('the effort environment variable wins over the settings', async ($, on) => {
+    const { clock } = setUp(on, {
+      model: 'claude-opus-5-5',
+      settings: { effortLevel: 'low' },
+      env: { CLAUDE_CODE_EFFORT_LEVEL: 'medium' },
+    })
+
+    await $.session.start(START)
+    await clock.settle()
+    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●○○○ medium ·')
   })
 
   test('a model that takes no effort shows none; the countdowns move with the clock', async ($, on) => {
@@ -231,10 +396,10 @@ describe('status line under the prompt', () => {
     await $.session.start(START)
     await step($, { model: world.model })
     await clock.settle()
-    expect((await bar($))[0]).toBe(`✻ Haiku 5.5  │  ctx ━━──────── 23%  46k/200k  │  ${LIMITS}`)
+    expect((await bar($))[0]).toBe(`✻ Haiku 5.5 · C ━━──────── 23%  46k/200k · ${LIMITS}`)
 
     await clock.advance(60 * MINUTE)
-    expect((await bar($))[0]).toEndWith('28%  ↻1h13m   주간 ━━━━────── 42%  ↻3d')
+    expect((await bar($))[0]).toEndWith('28%  ↻1h13m   W ━━━━────── 42%  ↻3d')
   })
 
   test('on Fable it adds the used Fable weekly limit from the usage endpoint', async ($, on) => {
@@ -278,6 +443,37 @@ describe('status line under the prompt', () => {
     expect((await bar($))[0]).toEndWith('Fable ━━━━━━──── 60%')
   })
 
+  test('the /model output row switches the model at once', async ($, on) => {
+    const { clock, world } = setUp(on, {
+      model: 'claude-opus-5-5',
+      settings: { modelSettings: { 'claude-sonnet-5-5': { effortLevel: 'medium' } } },
+    })
+
+    await $.session.start(START)
+    await step($, { model: world.model, effort: 'max' })
+    await clock.settle()
+    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●●● max ·')
+
+    // classic.PostModelSwitch 없이 /model의 결과 줄만 온다.
+    world.model = 'claude-sonnet-5-5'
+    await $.session.append({
+      message: {
+        type: 'user',
+        content: [
+          {
+            type: 'text',
+            text: '<local-command-stdout>Set model to `Sonnet 5.5` and saved as your default for new sessions</local-command-stdout>',
+          },
+        ],
+      },
+      door: 'command',
+      origin: { kind: 'composer' },
+      uuid: 'row-model',
+    })
+    await clock.settle()
+    expect((await bar($))[0]).toStartWith('✻ Sonnet 5.5  ●●○○○ medium ·')
+  })
+
   test('switching to Fable resets effort and reads the Fable limit', async ($, on) => {
     const { clock, fetches, world } = setUp(on, { model: 'claude-opus-5-5' })
 
@@ -301,7 +497,7 @@ describe('status line under the prompt', () => {
     await clock.settle()
     expect(fetches).toHaveLength(1)
     const [row] = await bar($)
-    expect(row).toStartWith('✻ Fable 5.1  effort ?  │')
+    expect(row).toStartWith('✻ Fable 5.1  effort ? ·')
     expect(row).toEndWith('Fable ━━━━━━──── 60%')
   })
 
@@ -311,7 +507,7 @@ describe('status line under the prompt', () => {
     await $.session.start(START)
     await clock.settle()
     expect(fetches).toHaveLength(1)
-    expect(await bar($)).toEqual([`✻ Opus 5.5  effort ?  │  ctx ────────── —  —/200k  │  ${LIMITS}`])
+    expect(await bar($)).toEqual([`✻ Opus 5.5  effort ? · C ────────── —  —/200k · ${LIMITS}`])
   })
 
   test('an API-key session shows no plan limits and never calls the endpoint', async ($, on) => {
@@ -325,7 +521,7 @@ describe('status line under the prompt', () => {
     await clock.settle()
     await clock.advance(60 * MINUTE)
     expect(fetches).toHaveLength(0)
-    expect(await bar($)).toEqual(['✻ Fable 5.1  effort ?  │  ctx ────────── —  —/200k'])
+    expect(await bar($)).toEqual(['✻ Fable 5.1  effort ? · C ────────── —  —/200k'])
   })
 
   test('before the first reading only the engine line is drawn', async ($, on) => {
@@ -340,9 +536,175 @@ describe('status line under the prompt', () => {
     await $.session.start(START)
     await clock.settle()
     expect(await bar($, { columns: 80 })).toEqual([
-      '✻ Opus 5.5  effort ?  │  ctx ━━──────── 23%  46k/200k',
+      '✻ Opus 5.5  effort ? · C ━━──────── 23%  46k/200k',
       LIMITS,
     ])
+  })
+})
+
+describe('git row', () => {
+  test('project, branch, changes and upstream', async ($, on) => {
+    const { clock, runs } = setUp(on, {
+      model: 'claude-opus-5-5',
+      repo: { root: ROOT, remote: REMOTE, status: FEATURE_STATUS },
+    })
+
+    await $.session.start(START)
+    await clock.settle()
+    for (const surface of ['terminal', 'desktop'] as const) {
+      expect(await bar($, { surface })).toEqual(['my-claude · feature/bar · !2+2?3⇡2⇣1', OPUS_ROW])
+    }
+    // git은 선택적 잠금 없이 읽어 모델의 git 명령과 index.lock을 다투지 않는다.
+    expect(runs.filter(argv => argv[0] === 'git').every(argv => argv[1] === '--no-optional-locks')).toBe(true)
+  })
+
+  test('a file guard that refuses the git directory only drops the operation mark', async ($, on) => {
+    const { clock } = setUp(on, {
+      model: 'claude-opus-5-5',
+      isFsRefused: true,
+      repo: {
+        root: ROOT,
+        remote: REMOTE,
+        status: porcelain(`# branch.oid ${OID}`, '# branch.head worktree-fix-bar'),
+        paths: `${ROOT}/.git/worktrees/fix-bar\n${ROOT}/.git\n${ROOT}/.claude/worktrees/fix-bar\n`,
+        markers: ['MERGE_HEAD'],
+      },
+    })
+
+    await $.session.start(START)
+    await clock.settle()
+    expect((await bar($))[0]).toBe('my-claude/fix-bar · worktree-fix-bar')
+  })
+
+  test('a linked worktree, a rebase on a detached HEAD and a conflict', async ($, on) => {
+    const { clock } = setUp(on, {
+      model: 'claude-opus-5-5',
+      repo: {
+        root: ROOT,
+        remote: REMOTE,
+        status: porcelain(
+          `# branch.oid ${OID}`,
+          '# branch.head (detached)',
+          'u UU N... 100644 100644 100644 100644 aaa bbb ccc hooks/register.tsx',
+        ),
+        paths: `${ROOT}/.git/worktrees/fix-bar\n${ROOT}/.git\n${ROOT}/.claude/worktrees/fix-bar\n`,
+        markers: ['rebase-merge'],
+      },
+    })
+
+    await $.session.start(START)
+    await clock.settle()
+    expect(await bar($)).toEqual(['my-claude/fix-bar · (1234567) (REBASING) · =1', OPUS_ROW])
+  })
+
+  test('a push that sets the upstream shows at once', async ($, on) => {
+    const repo: Repo = { root: ROOT, remote: REMOTE, status: porcelain(`# branch.oid ${OID}`, '# branch.head topic') }
+    const { clock } = setUp(on, { model: 'claude-opus-5-5', repo })
+
+    await $.session.start(START)
+    await clock.settle()
+    expect(await bar($)).toEqual(['my-claude · topic', OPUS_ROW])
+
+    repo.status = porcelain(`# branch.oid ${OID}`, '# branch.head topic', '# branch.upstream origin/topic', '# branch.ab +0 -1')
+    await $.tool.call({ tool: 'Bash', command: 'git push -u origin topic', description: 'Push the branch' })
+    await clock.settle()
+    expect(await bar($)).toEqual(['my-claude · topic · ⇣1', OPUS_ROW])
+  })
+
+  test('the PR state of the branch: conflicts, CI and review, from the origin owner\'s PR', async ($, on) => {
+    const { clock, runs } = setUp(on, {
+      model: 'claude-opus-5-5',
+      repo: { root: ROOT, remote: REMOTE, status: FEATURE_STATUS },
+      prs: [
+        prRow({ mergeStateStatus: 'CLEAN' }, 'stranger'),
+        prRow({
+          mergeable: 'CONFLICTING',
+          mergeStateStatus: 'DIRTY',
+          reviewDecision: 'REVIEW_REQUIRED',
+          statusCheckRollup: [CHECK('SUCCESS'), CHECK('FAILURE')],
+        }),
+      ],
+    })
+
+    await $.session.start(START)
+    await clock.settle()
+    expect((await bar($))[0]).toBe('my-claude · feature/bar · !2+2?3⇡2⇣1 · PR #1')
+    expect(runs.filter(argv => argv[0] === 'gh')).toEqual([['gh', 'pr', 'list', '--head', 'feature/bar', ...GH_ARGS]])
+    // PR 번호는 누르면 기본 브라우저로 PR 페이지를 여는 버튼이다.
+    const ui = await $.ui.mount({
+      plugin: 'statusbar',
+      surface: 'terminal',
+      component: 'PromptHint',
+      props: { isDraft: false, isWorking: false, hint: ENGINE_LINE },
+      viewport: { columns: 164, rows: 40, isFullscreen: true },
+    })
+    await ui.press({ key: `open:${PR_URL}` })
+    await ui.unmount()
+    expect(runs.at(-1)).toEqual(['open', PR_URL])
+  })
+
+  test('PR state is asked again every 3 minutes, sooner while GitHub has not decided, and after PR commands', async ($, on) => {
+    const repo: Repo = { root: ROOT, remote: REMOTE, status: porcelain(`# branch.oid ${OID}`, '# branch.head topic') }
+    const { clock, runs, world } = setUp(on, {
+      model: 'claude-opus-5-5',
+      repo,
+      prs: [prRow({ isDraft: true, mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' })],
+    })
+    const asked = () => runs.filter(argv => argv[0] === 'gh').length
+
+    await $.session.start(START)
+    await clock.settle()
+    expect((await bar($))[0]).toBe('my-claude · topic · PR #1')
+
+    // GitHub가 머지 가능 여부를 아직 몰라(UNKNOWN) 20초가 지난 다음 git 확인(30초 주기) 때 다시 묻는다.
+    world.prs = [prRow({ statusCheckRollup: [CHECK('', 'IN_PROGRESS')], reviewDecision: 'APPROVED' })]
+    await clock.advance(30_000)
+    expect(asked()).toBe(2)
+    expect((await bar($))[0]).toBe('my-claude · topic · PR #1')
+
+    await clock.advance(2 * MINUTE)
+    expect(asked()).toBe(2)
+    await clock.advance(MINUTE)
+    expect(asked()).toBe(3)
+
+    // gh가 GitHub 오류로 실패해도 PR 명령 뒤에는 바로 다시 묻는다.
+    world.prs = [prRow({ state: 'MERGED' })]
+    world.isBashFailing = true
+    await $.tool.call({ tool: 'Bash', command: 'gh pr merge --squash', description: 'Merge the PR' })
+    await clock.settle()
+    expect(asked()).toBe(4)
+    expect((await bar($))[0]).toBe('my-claude · topic · PR #1')
+  })
+
+  test('a push or pull from another terminal asks for the PR state on the next poll', async ($, on) => {
+    const ahead = (count: number) =>
+      porcelain(`# branch.oid ${OID}`, '# branch.head topic', '# branch.upstream origin/topic', `# branch.ab +${count} -0`)
+    const repo: Repo = { root: ROOT, remote: REMOTE, status: ahead(2) }
+    const { clock, runs } = setUp(on, { model: 'claude-opus-5-5', repo, prs: [prRow({})] })
+    const asked = () => runs.filter(argv => argv[0] === 'gh').length
+
+    await $.session.start(START)
+    await clock.settle()
+    expect(asked()).toBe(1)
+    await clock.advance(30_000)
+    expect(asked()).toBe(1)
+
+    repo.status = ahead(0)
+    await clock.advance(30_000)
+    expect(asked()).toBe(2)
+  })
+
+  test('a change from another terminal shows on the next poll', async ($, on) => {
+    const repo: Repo = { root: ROOT, remote: null, status: porcelain(`# branch.oid ${OID}`, '# branch.head main') }
+    const { clock } = setUp(on, { model: 'claude-opus-5-5', repo })
+
+    await $.session.start(START)
+    await clock.settle()
+    expect((await bar($))[0]).toBe('my-claude · main')
+
+    repo.status = porcelain(`# branch.oid ${OID}`, '# branch.head main', '? new-file.ts')
+    await clock.advance(30_000)
+    expect((await bar($))[0]).toBe('my-claude · main · ?1')
   })
 })
 
@@ -421,12 +783,12 @@ describe('layout', () => {
     const colorAfter = (label: string) =>
       row[row.findIndex(part => part.text === `${label} `) + 1]?.style?.color
 
-    expect(colorAfter('ctx')).toBe('#fab219')
-    expect(colorAfter('5h')).toBe('#d03b3b')
-    expect(colorAfter('주간')).toBe('#0ca30c')
+    expect(colorAfter('C')).toBe('#fab219')
+    expect(colorAfter('S')).toBe('#d03b3b')
+    expect(colorAfter('W')).toBe('#0ca30c')
     expect(colorAfter('Fable')).toBe('#ec835a')
     expect(row.filter(part => part.text === ' !')).toHaveLength(1)
-    expect(textOfRow(row)).toContain('5h ━━━━━━━━━─ 92% !  ↻2h13m')
+    expect(textOfRow(row)).toContain('S ━━━━━━━━━─ 92% !  ↻2h13m')
     expect(textOfRow(row)).toContain('Fable ━━━━━━━━── 80%  ↻3d')
   })
 
@@ -452,6 +814,50 @@ describe('layout', () => {
     expect(layoutRows(SNAPSHOT, 200)).toHaveLength(1)
     expect(layoutRows(SNAPSHOT, 100)).toHaveLength(2)
     expect(layoutRows(SNAPSHOT, 40).length).toBeGreaterThan(2)
+  })
+
+  const NONE = { conflicted: 0, stashed: 0, deleted: 0, renamed: 0, modified: 0, staged: 0, untracked: 0 }
+  const GIT: StatusbarGit = {
+    project: 'my-claude',
+    worktree: 'fix-bar',
+    branch: 'feature/statusbar-git-row-with-pull-request-link',
+    upstream: { ahead: 3, behind: 0 },
+    changes: { ...NONE, staged: 1, modified: 2 },
+  }
+  const gitRowOf = (columns: number, git: StatusbarGit = GIT) => layoutRows({ ...SNAPSHOT, git }, columns).at(0) ?? []
+
+  test('the git row reads like the starship prompt and shortens the branch when narrow', () => {
+    const wide = gitRowOf(200)
+    expect(textOfRow(wide)).toBe('my-claude/fix-bar · feature/statusbar-git-row-with-pull-request-link · !2+1⇡3')
+    // 프롬프트와 같은 색: 경로 하늘색, 브랜치 회색, 상태 노랑.
+    const styleOf = (text: string) => wide.find(part => part.text === text)?.style
+    expect(styleOf('my-claude/fix-bar')).toEqual({ color: '#57C7FF', bold: true })
+    expect(styleOf('feature/statusbar-git-row-with-pull-request-link')).toEqual({ color: 'gray', bold: true })
+    expect(styleOf('!2+1⇡3')).toEqual({ color: 'yellow' })
+    for (const columns of [70, 60, 50]) {
+      const row = textOfRow(gitRowOf(columns))
+      expect(displayWidth(row)).toBe(columns)
+      expect(row).toStartWith('my-claude/fix-bar · feature/')
+      expect(row).toEndWith('… · !2+1⇡3')
+    }
+    // 깨끗하고 upstream과 같으면 경로와 브랜치만, HEAD가 떨어지면 (커밋).
+    expect(textOfRow(gitRowOf(200, { project: 'my-claude', branch: 'main', upstream: { ahead: 0, behind: 0 }, changes: NONE }))).toBe(
+      'my-claude · main',
+    )
+    const detached = gitRowOf(200, { project: 'my-claude', commit: '1234567', changes: NONE })
+    expect(textOfRow(detached)).toBe('my-claude · (1234567)')
+    expect(detached.at(-1)?.style).toEqual({ color: 'green', bold: true })
+  })
+
+  test('the status marks follow starship: =$×»!+? then ⇡⇣, written together', () => {
+    expect(
+      gitStatusText({
+        changes: { conflicted: 1, stashed: 2, deleted: 3, renamed: 4, modified: 5, staged: 6, untracked: 7 },
+        upstream: { ahead: 1, behind: 2 },
+      }),
+    ).toBe('=1$2×3»4!5+6?7⇡1⇣2')
+    expect(gitStatusText({ changes: NONE, upstream: { ahead: 0, behind: 4 } })).toBe('⇣4')
+    expect(gitStatusText({ changes: NONE })).toBe('')
   })
 })
 
@@ -494,6 +900,78 @@ describe('formatting', () => {
     expect(effortFrom("Theme set to 'dark' instead")).toBeUndefined()
     expect(effortFrom('Effort picker closed')).toBeUndefined()
     expect(effortFrom(undefined)).toBeUndefined()
+  })
+
+  test('git status --porcelain=v2 --branch --show-stash, counted as starship does', () => {
+    const none = { conflicted: 0, stashed: 0, deleted: 0, renamed: 0, modified: 0, staged: 0, untracked: 0 }
+    expect(gitStatusOf(FEATURE_STATUS)).toEqual({
+      branch: 'feature/bar',
+      upstream: { ahead: 2, behind: 1 },
+      changes: { ...none, modified: 2, staged: 2, untracked: 3 },
+    })
+    // 첫 커밋 전, 사라진 upstream(ab 없음), 스태시 2개, 이름 바꿈(2), 지움(D가 어느 쪽이든), 새로 추가(A.).
+    expect(
+      gitStatusOf(
+        porcelain(
+          '# branch.oid (initial)',
+          '# branch.head main',
+          '# branch.upstream origin/gone',
+          '# stash 2',
+          '2 R. N... 1 2 3 a b R100 new\told',
+          '1 D. N... 1 2 3 a b gone.ts',
+          '1 .D N... 1 2 3 a b lost.ts',
+          '1 A. N... 1 2 3 a b added.ts',
+        ),
+      ),
+    ).toEqual({ branch: 'main', changes: { ...none, stashed: 2, deleted: 2, renamed: 1, staged: 1 } })
+    expect(gitStatusOf(porcelain(`# branch.oid ${OID}`, '# branch.head (detached)'))).toEqual({
+      commit: '1234567',
+      changes: none,
+    })
+  })
+
+  test('the PR number wears its state as a color', () => {
+    const colorOf = (fields: Record<string, unknown>) => {
+      const pr = pullRequestOf(prRow(fields))
+      return pr === undefined ? undefined : pullRequestColor(pr)
+    }
+    expect(colorOf({ isDraft: true, mergeStateStatus: 'DRAFT' })).toBe('inactive')
+    expect(colorOf({ reviewDecision: 'REVIEW_REQUIRED', mergeStateStatus: 'BLOCKED' })).toBe('#ec835a')
+    expect(colorOf({ reviewDecision: '' })).toBe('#ec835a')
+    expect(colorOf({ reviewDecision: 'APPROVED', statusCheckRollup: [CHECK('SUCCESS')] })).toBe('#0ca30c')
+    expect(colorOf({ reviewDecision: 'APPROVED', statusCheckRollup: [CHECK('', 'IN_PROGRESS')] })).toBe('#ec835a')
+    expect(colorOf({ mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY', reviewDecision: 'APPROVED' })).toBe('#d03b3b')
+    expect(colorOf({ statusCheckRollup: [CHECK('FAILURE')] })).toBe('#d03b3b')
+    expect(colorOf({ reviewDecision: 'CHANGES_REQUESTED' })).toBe('#d03b3b')
+    expect(colorOf({ state: 'MERGED' })).toBe('merged')
+  })
+
+  test('the PR state of gh pr list', () => {
+    expect(pullRequestOf(prRow({}))).toEqual({ number: 1, url: PR_URL, state: 'open', merge: 'clean' })
+    expect(pullRequestOf(prRow({ isDraft: true, mergeStateStatus: 'DRAFT' }))).toEqual({ number: 1, url: PR_URL, state: 'draft' })
+    expect(pullRequestOf(prRow({ mergeStateStatus: 'BEHIND', reviewDecision: 'CHANGES_REQUESTED' }))).toEqual({
+      number: 1,
+      url: PR_URL,
+      state: 'open',
+      merge: 'behind',
+      review: 'changes',
+    })
+    // StatusContext는 state만 준다.
+    expect(pullRequestOf(prRow({ statusCheckRollup: [{ __typename: 'StatusContext', state: 'SUCCESS' }, CHECK('SKIPPED')] }))?.checks).toBe('pass')
+    expect(pullRequestOf(prRow({ state: 'CLOSED', mergeable: 'CONFLICTING' }))).toEqual({ number: 1, url: PR_URL, state: 'closed' })
+  })
+
+  test('the owner of the origin remote', () => {
+    expect(remoteOwner(REMOTE)).toBe('DevooKim')
+    expect(remoteOwner('git@github.com:DevooKim/my-claude.git')).toBe('DevooKim')
+    expect(remoteOwner('ssh://git@github.com/DevooKim/my-claude')).toBe('DevooKim')
+    expect(remoteOwner(null)).toBeUndefined()
+  })
+
+  test('fitted text', () => {
+    expect(fitText('feature/long-name', 8)).toBe('feature…')
+    expect(fitText('테스트 실행 중', 7)).toBe('테스트…')
+    expect(fitText('short', 8)).toBe('short')
   })
 
   test('the Fable row of limits[]', () => {
