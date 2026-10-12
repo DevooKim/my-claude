@@ -159,10 +159,7 @@ export const register: Register = on => {
       await restore($, state)
       if (state.effort.kind === 'unknown') state.effort = await configuredEffort($)
       state.isReducedMotion = await prefersReducedMotion($)
-      state.ticker?.cancel()
-      state.ticker = $.clock.every(TICK_MS, () => void refresh($, state))
-      syncAnimation($, state)
-      schedule($, state)
+      startLive($, state)
     }
 
     return next(e)
@@ -183,19 +180,23 @@ export const register: Register = on => {
     return yield* next(e)
   })
 
-  // /effort(선택 창 포함)의 결과 줄은 대화에 명령 출력으로 쌓인다: 다음 요청 전에 바로 반영한다.
+  // /effort·/model(선택 창 포함)의 결과 줄은 대화에 명령 출력으로 쌓인다: 다음 요청 전에
+  // 바로 반영한다. 사용자 플러그인의 classic.PostModelSwitch는 기본 보안 플러그인이
+  // 건너뛰므로 모델 전환도 이 줄로 알아챈다.
   on('session.append', { door: ['command', 'notice'] }, ($, e, next) => {
-    const level = effortFrom(textOfBlocks(e.message.content))
-    if (level !== undefined) noteEffort($, state, { kind: 'level', level })
+    const text = textOfBlocks(e.message.content)
+    const level = effortFrom(text)
+    if (isModelSwitch(text)) {
+      $.clock.after(0, () => void switchModel($, state, undefined, level))
+    } else if (level !== undefined) {
+      noteEffort($, state, { kind: 'level', level })
+    }
 
     return next(e)
   }).catch(($, e, next) => next(e))
 
   on('classic.PostModelSwitch', async ($, e, next) => {
-    state.effort = await configuredEffort($, e.to_model)
-    if (isFable(e.to_model)) state.isFableRequested = true
-    syncAnimation($, state)
-    schedule($, state)
+    await switchModel($, state, e.to_model)
 
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -205,7 +206,17 @@ export const register: Register = on => {
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
     const own = await next(e)
     const snapshot = await read($, snapshotAtom)
-    if (snapshot === null) return own
+    if (snapshot === null) {
+      // /clear는 새 세션 id로 넘어가며 세션의 $.state를 비우지만 session.start는 다시
+      // 부르지 않고, 사용자 플러그인의 classic.SessionStart는 기본 보안 플러그인이 건너뛴다.
+      // 그래서 이미 쓴 스냅숏이 비어 읽히면 그리기 밖(타이머)에서 다시 세운다.
+      if (state.isLive && state.published !== undefined) {
+        state.published = undefined
+        $.clock.after(0, () => startLive($, state))
+      }
+
+      return own
+    }
     const { Box, Text } = $.ui.resolve(e)
     const columns = Math.max(MIN_COLUMNS, (e.viewport?.columns ?? FALLBACK_COLUMNS) - FOOTER_INSET)
     const frame = state.isReducedMotion ? undefined : Math.floor((await $.clock.now()) / FRAME_MS)
@@ -237,6 +248,17 @@ async function restore($: EngineInterface, state: State): Promise<void> {
   if (previous.fableFetchedAt !== undefined) state.lastFetchedAt = previous.fableFetchedAt
 }
 
+// 타이머를 새로 걸고 스냅숏을 다시 쓴다. 몇 번 불러도 같은 모습이 된다.
+function startLive($: EngineInterface, state: State): void {
+  state.ticker?.cancel()
+  state.ticker = $.clock.every(TICK_MS, () => void refresh($, state))
+  state.animator?.cancel()
+  state.animator = undefined
+  syncAnimation($, state)
+  state.published = undefined
+  schedule($, state)
+}
+
 // 첫 요청 전에는 보낼 effort를 알 길이 없으므로 엔진이 읽는 설정에서 미리 짐작한다:
 // 환경 변수 → 모델별 설정(modelSettings) → effortLevel. 첫 요청이 실제 값으로 고친다.
 async function configuredEffort($: EngineInterface, model?: string): Promise<StatusbarEffort> {
@@ -257,6 +279,24 @@ async function configuredEffort($: EngineInterface, model?: string): Promise<Sta
     $.ui.log(`statusbar: effort setting not read: ${describe(error)}`, { to: 'debug' })
 
     return { kind: 'unknown' }
+  }
+}
+
+// 바뀐 모델의 effort는 설정에서 다시 짐작한다. 같은 줄이 effort도 정했으면 그 값을 쓴다.
+async function switchModel(
+  $: EngineInterface,
+  state: State,
+  model?: string,
+  level?: string,
+): Promise<void> {
+  try {
+    const current = model ?? (await $.session.model())
+    state.effort = level === undefined ? await configuredEffort($, current) : { kind: 'level', level }
+    if (isFable(current)) state.isFableRequested = true
+    syncAnimation($, state)
+    schedule($, state)
+  } catch (error) {
+    $.ui.log(`statusbar: model switch not noted: ${describe(error)}`, { to: 'debug' })
   }
 }
 
@@ -328,15 +368,17 @@ async function runRefresh($: EngineInterface, state: State): Promise<void> {
 }
 
 async function publish($: EngineInterface, state: State) {
-  const [model, usage, now] = await Promise.all([
+  const [model, usage, now, current] = await Promise.all([
     $.session.model(),
     $.session.usage(),
     $.clock.now(),
+    read($, snapshotAtom),
   ])
   const snapshot = snapshotOf(state, model, usage, now)
-  // 카운트다운은 분 단위라 같은 분 안에서는 다시 쓰지 않는다.
+  // 카운트다운은 분 단위라 같은 분 안에서는 다시 쓰지 않는다. 다만 /clear로 스냅숏이
+  // 비었으면 같은 값이라도 다시 쓴다(신호보다 비우기가 늦어도 다음 갱신이 되살린다).
   const key = JSON.stringify({ ...snapshot, now: Math.floor(now / 60_000) })
-  if (key !== state.published) {
+  if (key !== state.published || current === null) {
     state.published = key
     await update($, snapshotAtom, () => snapshot)
   }
@@ -657,6 +699,11 @@ export function effortFrom(text: string | undefined): string | undefined {
   const level = match?.[1]?.toLowerCase()
 
   return level !== undefined && EFFORT_LEVELS.includes(level) ? level : undefined
+}
+
+// /model이 남기는 문장: "Set model to `Sonnet 5.5` and saved as your default for new sessions".
+export function isModelSwitch(text: string): boolean {
+  return /\bset model to\b/i.test(text)
 }
 
 function textOfBlocks(blocks: readonly ApiContentBlock[]): string {

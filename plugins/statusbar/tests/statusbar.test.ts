@@ -95,6 +95,18 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.measure', ($, e) => ({ changed: e.changed }))
   on('classic.PostModelSwitch', () => ({}))
+  // /clear가 세션의 상태를 비운 모습: 플러그인이 다시 쓸 때까지 스냅숏은 비어 읽힌다.
+  const session = { isWiped: false, wipe: () => void (session.isWiped = true) }
+  on('state.get', { plugin: 'statusbar', key: 'snapshot' }, async ($, e, next) => {
+    const held = await next(e)
+
+    return session.isWiped && held.value !== undefined ? { value: { ...held.value, value: undefined } } : held
+  })
+  on('state.set', { plugin: 'statusbar', key: 'snapshot' }, ($, e, next) => {
+    session.isWiped = false
+
+    return next(e)
+  })
   on('turn.step', async function* ($, e) {
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
   })
@@ -121,7 +133,7 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
   // 엔진 대신 힌트 줄을 그린다: 플러그인 트리는 이 줄을 그대로 품어야 한다.
   on('ui.render', () => ({ type: 'Box', children: [ENGINE_LINE] }))
 
-  return { world, fetches, clock, redraws }
+  return { world, fetches, clock, redraws, session }
 }
 
 const START = { cwd: '/work', surface: 'terminal', isInteractive: true } as const
@@ -206,6 +218,35 @@ describe('status line under the prompt', () => {
     await step($, { model: 'claude-haiku-5-5', effort: 'low', agentId: 'sub-1' })
     await clock.settle()
     expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●●● max  │')
+  })
+
+  test('after /clear empties the session state the bar is drawn again at once', async ($, on) => {
+    const { clock, session } = setUp(on, { model: 'claude-opus-5-5' })
+
+    await $.session.start(START)
+    await step($, { model: 'claude-opus-5-5', effort: 'high' })
+    await clock.settle()
+    const before = await bar($)
+
+    // /clear: 세션의 상태가 비고 아무 신호 없이 힌트 줄만 다시 그려진다. 값은 그대로다.
+    session.wipe()
+    expect(await footer($)).toEqual([ENGINE_LINE])
+    await clock.settle()
+    expect(await bar($)).toEqual(before)
+    expect(before[0]).toStartWith('✻ Opus 5.5  ●●●○○ high  │')
+  })
+
+  test('an emptied snapshot is written again by the next refresh in the same minute', async ($, on) => {
+    const { clock, session, world } = setUp(on, { model: 'claude-opus-5-5' })
+
+    await $.session.start(START)
+    await clock.settle()
+    expect(await bar($)).toEqual([OPUS_ROW])
+
+    session.wipe()
+    await $.session.measure({ context: world.usage.context, rateLimits: HEADER_LIMITS, changed: ['context'] })
+    await clock.settle()
+    expect(await bar($)).toEqual([OPUS_ROW])
   })
 
   test('the /effort output row updates effort before the next request', async ($, on) => {
@@ -304,6 +345,37 @@ describe('status line under the prompt', () => {
     await clock.advance(MINUTE)
     expect(fetches).toHaveLength(2)
     expect((await bar($))[0]).toEndWith('Fable ━━━━━━──── 60%')
+  })
+
+  test('the /model output row switches the model at once', async ($, on) => {
+    const { clock, world } = setUp(on, {
+      model: 'claude-opus-5-5',
+      settings: { modelSettings: { 'claude-sonnet-5-5': { effortLevel: 'medium' } } },
+    })
+
+    await $.session.start(START)
+    await step($, { model: world.model, effort: 'max' })
+    await clock.settle()
+    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●●● max  │')
+
+    // classic.PostModelSwitch 없이 /model의 결과 줄만 온다.
+    world.model = 'claude-sonnet-5-5'
+    await $.session.append({
+      message: {
+        type: 'user',
+        content: [
+          {
+            type: 'text',
+            text: '<local-command-stdout>Set model to `Sonnet 5.5` and saved as your default for new sessions</local-command-stdout>',
+          },
+        ],
+      },
+      door: 'command',
+      origin: { kind: 'composer' },
+      uuid: 'row-model',
+    })
+    await clock.settle()
+    expect((await bar($))[0]).toStartWith('✻ Sonnet 5.5  ●●○○○ medium  │')
   })
 
   test('switching to Fable resets effort and reads the Fable limit', async ($, on) => {
