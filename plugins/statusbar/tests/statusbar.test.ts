@@ -22,6 +22,7 @@ import {
   gitStatusText,
   layoutRows,
   prettyModel,
+  pullRequestColor,
   pullRequestOf,
   remoteOwner,
   resetIn,
@@ -627,7 +628,7 @@ describe('git row', () => {
 
     await $.session.start(START)
     await clock.settle()
-    expect((await bar($))[1]).toBe('my-claude · feature/bar · !2+2?3⇡2⇣1 · PR #1  충돌  CI 실패  리뷰 필요')
+    expect((await bar($))[1]).toBe('my-claude · feature/bar · !2+2?3⇡2⇣1 · PR #1')
     expect(runs.filter(argv => argv[0] === 'gh')).toEqual([['gh', 'pr', 'list', '--head', 'feature/bar', ...GH_ARGS]])
     // PR 번호는 누르면 기본 브라우저로 PR 페이지를 여는 버튼이다.
     const ui = await $.ui.mount({
@@ -653,13 +654,13 @@ describe('git row', () => {
 
     await $.session.start(START)
     await clock.settle()
-    expect((await bar($))[1]).toBe('my-claude · topic · PR #1  draft')
+    expect((await bar($))[1]).toBe('my-claude · topic · PR #1')
 
     // GitHub가 머지 가능 여부를 아직 몰라(UNKNOWN) 20초가 지난 다음 git 확인(15초 주기) 때 다시 묻는다.
     world.prs = [prRow({ statusCheckRollup: [CHECK('', 'IN_PROGRESS')], reviewDecision: 'APPROVED' })]
     await clock.advance(30_000)
     expect(asked()).toBe(2)
-    expect((await bar($))[1]).toBe('my-claude · topic · PR #1  머지 가능  CI 진행 중  승인됨')
+    expect((await bar($))[1]).toBe('my-claude · topic · PR #1')
 
     await clock.advance(2 * MINUTE)
     expect(asked()).toBe(2)
@@ -672,7 +673,7 @@ describe('git row', () => {
     await $.tool.call({ tool: 'Bash', command: 'gh pr merge --squash', description: 'Merge the PR' })
     await clock.settle()
     expect(asked()).toBe(4)
-    expect((await bar($))[1]).toBe('my-claude · topic · PR #1  merged')
+    expect((await bar($))[1]).toBe('my-claude · topic · PR #1')
   })
 
   test('a change from another terminal shows on the next poll', async ($, on) => {
@@ -909,6 +910,22 @@ describe('formatting', () => {
       commit: '1234567',
       changes: none,
     })
+  })
+
+  test('the PR number wears its state as a color', () => {
+    const colorOf = (fields: Record<string, unknown>) => {
+      const pr = pullRequestOf(prRow(fields))
+      return pr === undefined ? undefined : pullRequestColor(pr)
+    }
+    expect(colorOf({ isDraft: true, mergeStateStatus: 'DRAFT' })).toBe('inactive')
+    expect(colorOf({ reviewDecision: 'REVIEW_REQUIRED', mergeStateStatus: 'BLOCKED' })).toBe('#ec835a')
+    expect(colorOf({ reviewDecision: '' })).toBe('#ec835a')
+    expect(colorOf({ reviewDecision: 'APPROVED', statusCheckRollup: [CHECK('SUCCESS')] })).toBe('#0ca30c')
+    expect(colorOf({ reviewDecision: 'APPROVED', statusCheckRollup: [CHECK('', 'IN_PROGRESS')] })).toBe('#ec835a')
+    expect(colorOf({ mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY', reviewDecision: 'APPROVED' })).toBe('#d03b3b')
+    expect(colorOf({ statusCheckRollup: [CHECK('FAILURE')] })).toBe('#d03b3b')
+    expect(colorOf({ reviewDecision: 'CHANGES_REQUESTED' })).toBe('#d03b3b')
+    expect(colorOf({ state: 'MERGED' })).toBe('merged')
   })
 
   test('the PR state of gh pr list', () => {

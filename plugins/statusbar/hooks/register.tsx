@@ -121,21 +121,17 @@ const BRANCH_COLOR = 'gray'
 const COMMIT_COLOR = 'green'
 const GIT_STATUS_COLOR = 'yellow'
 const MIN_BRANCH_COLUMNS = 12
-// PR 상태 말과 색: 막는 것은 빨강, 기다리는 것은 노랑, 된 것은 초록.
-const PR_LABELS: readonly { text: string; color: string; is: (pr: StatusbarPullRequest) => boolean }[] = [
-  { text: 'merged', color: 'merged', is: pr => pr.state === 'merged' },
-  { text: 'closed', color: 'error', is: pr => pr.state === 'closed' },
-  { text: 'draft', color: 'inactive', is: pr => pr.state === 'draft' },
-  { text: '충돌', color: '#d03b3b', is: pr => pr.merge === 'conflict' },
-  { text: '뒤처짐', color: 'warning', is: pr => pr.merge === 'behind' },
-  { text: '머지 가능', color: 'success', is: pr => pr.state === 'open' && pr.merge === 'clean' },
-  { text: 'CI 실패', color: '#d03b3b', is: pr => pr.checks === 'fail' },
-  { text: 'CI 진행 중', color: 'warning', is: pr => pr.checks === 'pending' },
-  { text: 'CI 통과', color: 'success', is: pr => pr.checks === 'pass' },
-  { text: '변경 요청', color: '#d03b3b', is: pr => pr.review === 'changes' },
-  { text: '리뷰 필요', color: 'warning', is: pr => pr.review === 'required' },
-  { text: '승인됨', color: 'success', is: pr => pr.review === 'approved' },
-]
+// PR 번호의 색이 곧 상태다: draft 회색, 머지할 수 있지만 승인 전이면 주황, 승인까지 끝났으면 초록,
+// 충돌·CI 실패·변경 요청으로 머지할 수 없으면 빨강. 병합된 PR은 보라, 닫힌 PR은 흐리게.
+export function pullRequestColor(pr: StatusbarPullRequest): string {
+  if (pr.state === 'merged') return 'merged'
+  if (pr.state === 'closed') return FAINT
+  if (pr.state === 'draft') return MUTED
+  if (pr.merge === 'conflict' || pr.checks === 'fail' || pr.review === 'changes') return STATUS_COLORS.critical
+  if (pr.review === 'approved' && pr.merge === 'clean' && pr.checks !== 'pending') return STATUS_COLORS.good
+
+  return STATUS_COLORS.serious
+}
 
 const snapshotAtom = atom({ plugin: 'statusbar', key: 'snapshot' } as const, null, {
   shape: 'v1',
@@ -908,15 +904,11 @@ function gitSpans(git: StatusbarGit, hasPr: boolean, branchColumns = Number.POSI
   )
 }
 
-// PR 번호(누르면 PR 페이지가 열림) 뒤에 상태 말들을 두 칸씩 띄워 늘어놓는다.
+// PR 번호는 상태 색으로 칠하고, 누르면 PR 페이지가 열린다.
 function pullRequestSpans(pr: StatusbarPullRequest): Span[] {
-  return joinSpans(
-    [
-      [span('PR ', { color: MUTED }, pr.url), span(`#${pr.number}`, { bold: true, underline: true }, pr.url)],
-      ...PR_LABELS.filter(label => label.is(pr)).map(label => [span(label.text, { color: label.color })]),
-    ],
-    [span('  ')],
-  )
+  const color = pullRequestColor(pr)
+
+  return [span('PR ', { color }, pr.url), span(`#${pr.number}`, { color, bold: true, underline: true }, pr.url)]
 }
 
 // starship의 $all_status$ahead_behind와 같은 순서·기호로 붙여 쓴다. 깨끗하고 upstream과 같으면 빈 글자.
