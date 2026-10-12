@@ -27,8 +27,6 @@ import {
   gitStatusText,
   layoutRows,
   prettyModel,
-  pullRequestOf,
-  remoteOwner,
   resetIn,
   statusOf,
   todoProgress,
@@ -52,8 +50,6 @@ const OPUS_ROW = `✻ Opus 5.5  effort ? · C ━━──────── 23%
 
 const ROOT = '/work/my-claude'
 const REMOTE = 'https://github.com/DevooKim/my-claude.git'
-const PR_URL = 'https://github.com/DevooKim/my-claude/pull/12'
-const DRAFT_URL = 'https://github.com/DevooKim/my-claude/pull/7'
 const OID = '1234567890abcdef1234567890abcdef12345678'
 const porcelain = (...lines: string[]) => `${lines.join('\n')}\n`
 // 스테이징 2(M., MM), 수정 2(.M, MM), 추적 안 함 3, upstream보다 2 앞서고 1 뒤처짐.
@@ -69,16 +65,7 @@ const FEATURE_STATUS = porcelain(
   '? scratch/',
   '? todo.txt',
 )
-const GH_LIST = ['gh', 'pr', 'list', '--head']
-const GH_FIELDS = ['--state', 'all', '--limit', '20', '--json', 'number,url,state,isDraft,headRepositoryOwner']
-// gh pr list의 한 줄. 소유자가 다르면 같은 이름의 브랜치로 남의 포크에서 연 PR이다.
-const prRow = (number: number, url: string, state: string, isDraft = false, login = 'DevooKim') => ({
-  number,
-  url,
-  state,
-  isDraft,
-  headRepositoryOwner: { id: `U_${login}`, login },
-})
+
 
 const usageOf = (rateLimits: SessionRateLimit[], tokens?: number): SessionUsage => ({
   startedAt: NOW,
@@ -123,8 +110,6 @@ type World = {
   env: Record<string, string>
   repo?: Repo
   isFsRefused: boolean
-  isBashFailing: boolean
-  prs: unknown[]
   agents: AgentInfo[]
   messages: SessionMessage[]
   bash: Record<string, unknown>
@@ -139,8 +124,6 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
     settings: {},
     env: {},
     isFsRefused: false,
-    isBashFailing: false,
-    prs: [],
     agents: [],
     messages: [],
     bash: { stdout: '', stderr: '', interrupted: false },
@@ -199,7 +182,6 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
     })
     const [command, ...args] = e.argv
     const { repo } = world
-    if (command === 'gh') return ran(0, JSON.stringify(world.prs))
     if (command === 'open') return ran(0, '')
     if (command !== 'git' || repo === undefined) return ran(128, '', 'fatal: not a git repository')
     if (args.includes('status')) return ran(0, repo.status)
@@ -229,8 +211,6 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
       return { result: { task: { id: String(tasks.count), subject: e.subject } } }
     }
     if (e.tool === 'TaskUpdate') return { result: { success: true, taskId: e.taskId, updatedFields: ['status'] } }
-
-    if (world.isBashFailing) return { isError: true as const, result: 'GraphQL: Something went wrong', text: 'GraphQL: Something went wrong' }
 
     return { result: world.bash }
   })
@@ -273,35 +253,6 @@ async function drawn(
   await ui.unmount()
 
   return tree
-}
-
-// 그린 트리의 버튼마다 주소(key)와 글자.
-async function buttonsOf(
-  $: Engine,
-  options: { surface?: RenderSurface } = {},
-): Promise<{ key: string; text: string }[]> {
-  const found: { key: string; text: string }[] = []
-  const walk = (node: RenderElement | string): void => {
-    if (typeof node === 'string') return
-    if (node.type === 'Button') found.push({ key: String(node.props.key), text: textOf(node) })
-    for (const child of 'children' in node ? (node.children ?? []) : []) walk(child)
-  }
-  walk(await drawn($, options))
-
-  return found
-}
-
-// 힌트 줄을 그린 채로 버튼 하나를 누른다.
-async function press($: Engine, key: string): Promise<void> {
-  const ui = await $.ui.mount({
-    plugin: 'statusbar',
-    surface: 'terminal',
-    component: 'PromptHint',
-    props: { isDraft: false, isWorking: false, hint: ENGINE_LINE },
-    viewport: { columns: 164, rows: 40, isFullscreen: true },
-  })
-  await ui.press({ key })
-  await ui.unmount()
 }
 
 // 프롬프트 아래 힌트 줄을 그려 줄마다의 글자를 돌려준다: 첫 줄은 엔진의 줄.
@@ -588,23 +539,19 @@ describe('status line under the prompt', () => {
 })
 
 describe('git row', () => {
-  test('project, branch, changes and upstream, then the PR as a link to its page', async ($, on) => {
+  test('project, branch, changes and upstream', async ($, on) => {
     const { clock, runs } = setUp(on, {
       model: 'claude-opus-5-5',
       repo: { root: ROOT, remote: REMOTE, status: FEATURE_STATUS },
-      // 더 최근의 첫 줄은 남의 포크에서 같은 이름의 브랜치로 연 PR이다.
-      prs: [prRow(40, 'https://github.com/DevooKim/my-claude/pull/40', 'OPEN', false, 'stranger'), prRow(12, PR_URL, 'OPEN')],
     })
 
     await $.session.start(START)
     await clock.settle()
     for (const surface of ['terminal', 'desktop'] as const) {
-      expect(await bar($, { surface })).toEqual([OPUS_ROW, 'my-claude · feature/bar · !2+2?3⇡2⇣1 · PR #12'])
-      expect(await buttonsOf($, { surface })).toEqual([{ key: `open:${PR_URL}`, text: 'PR #12' }])
+      expect(await bar($, { surface })).toEqual([OPUS_ROW, 'my-claude · feature/bar · !2+2?3⇡2⇣1'])
     }
     // git은 선택적 잠금 없이 읽어 모델의 git 명령과 index.lock을 다투지 않는다.
     expect(runs.filter(argv => argv[0] === 'git').every(argv => argv[1] === '--no-optional-locks')).toBe(true)
-    expect(runs.filter(argv => argv[0] === 'gh')).toEqual([[...GH_LIST, 'feature/bar', ...GH_FIELDS]])
   })
 
   test('a file guard that refuses the git directory only drops the operation mark', async ($, on) => {
@@ -625,8 +572,8 @@ describe('git row', () => {
     expect((await bar($))[1]).toBe('my-claude/fix-bar · worktree-fix-bar')
   })
 
-  test('a linked worktree, a rebase on a detached HEAD and a conflict; no PR lookup', async ($, on) => {
-    const { clock, runs } = setUp(on, {
+  test('a linked worktree, a rebase on a detached HEAD and a conflict', async ($, on) => {
+    const { clock } = setUp(on, {
       model: 'claude-opus-5-5',
       repo: {
         root: ROOT,
@@ -644,63 +591,25 @@ describe('git row', () => {
     await $.session.start(START)
     await clock.settle()
     expect(await bar($)).toEqual([OPUS_ROW, 'my-claude/fix-bar · (1234567) (REBASING) · =1'])
-    expect(runs.some(argv => argv[0] === 'gh')).toBe(false)
   })
 
-  test('without an upstream it says so; a PR command asks gh again at once, then every 5 minutes', async ($, on) => {
+  test('a push that sets the upstream shows at once', async ($, on) => {
     const repo: Repo = { root: ROOT, remote: REMOTE, status: porcelain(`# branch.oid ${OID}`, '# branch.head topic') }
-    const { clock, runs, world } = setUp(on, { model: 'claude-opus-5-5', repo })
-    const asked = () => runs.filter(argv => argv[0] === 'gh').length
+    const { clock } = setUp(on, { model: 'claude-opus-5-5', repo })
 
     await $.session.start(START)
     await clock.settle()
     expect(await bar($)).toEqual([OPUS_ROW, 'my-claude · topic'])
-    expect(asked()).toBe(1)
 
-    // 모델이 푸시하고 초안 PR을 연다: Bash의 기록이 그 PR 명령을 알린다.
-    repo.status = porcelain(`# branch.oid ${OID}`, '# branch.head topic', '# branch.upstream origin/topic', '# branch.ab +0 -0')
-    world.prs = [prRow(7, DRAFT_URL, 'OPEN', true)]
-    world.bash = {
-      stdout: '',
-      stderr: '',
-      interrupted: false,
-      gitOperation: { pr: { number: 7, url: DRAFT_URL, action: 'created' } },
-    }
-    await $.tool.call({ tool: 'Bash', command: 'gh pr create --draft --fill', description: 'Open a draft PR' })
+    repo.status = porcelain(`# branch.oid ${OID}`, '# branch.head topic', '# branch.upstream origin/topic', '# branch.ab +0 -1')
+    await $.tool.call({ tool: 'Bash', command: 'git push -u origin topic', description: 'Push the branch' })
     await clock.settle()
-    expect(await bar($)).toEqual([OPUS_ROW, 'my-claude · topic · PR #7 draft'])
-    expect(await buttonsOf($)).toEqual([{ key: `open:${DRAFT_URL}`, text: 'PR #7 draft' }])
-    // 누르면 기본 브라우저로 PR 페이지를 연다.
-    await press($, `open:${DRAFT_URL}`)
-    expect(runs.at(-1)).toEqual(['open', DRAFT_URL])
-    expect(asked()).toBe(2)
-
-    await clock.advance(4 * MINUTE)
-    expect(asked()).toBe(2)
-    await clock.advance(MINUTE)
-    expect(asked()).toBe(3)
-  })
-
-  test('a PR command that fails after GitHub made the PR still asks gh again', async ($, on) => {
-    const repo: Repo = { root: ROOT, remote: REMOTE, status: porcelain(`# branch.oid ${OID}`, '# branch.head topic') }
-    const { clock, runs, world } = setUp(on, { model: 'claude-opus-5-5', repo })
-    const asked = () => runs.filter(argv => argv[0] === 'gh').length
-
-    await $.session.start(START)
-    await clock.settle()
-    expect(asked()).toBe(1)
-
-    world.prs = [prRow(1, PR_URL, 'OPEN')]
-    world.isBashFailing = true
-    await $.tool.call({ tool: 'Bash', command: 'gh pr create --title x --body-file -', description: 'Open a PR' })
-    await clock.settle()
-    expect(asked()).toBe(2)
-    expect(await bar($)).toEqual([OPUS_ROW, 'my-claude · topic · PR #1'])
+    expect(await bar($)).toEqual([OPUS_ROW, 'my-claude · topic · ⇣1'])
   })
 
   test('a change from another terminal shows on the next poll', async ($, on) => {
     const repo: Repo = { root: ROOT, remote: null, status: porcelain(`# branch.oid ${OID}`, '# branch.head main') }
-    const { clock, runs } = setUp(on, { model: 'claude-opus-5-5', repo })
+    const { clock } = setUp(on, { model: 'claude-opus-5-5', repo })
 
     await $.session.start(START)
     await clock.settle()
@@ -709,8 +618,6 @@ describe('git row', () => {
     repo.status = porcelain(`# branch.oid ${OID}`, '# branch.head main', '? new-file.ts')
     await clock.advance(15_000)
     expect((await bar($))[1]).toBe('my-claude · main · ?1')
-    // 원격이 없으면 PR을 묻지 않는다.
-    expect(runs.some(argv => argv[0] === 'gh')).toBe(false)
   })
 })
 
@@ -934,26 +841,22 @@ describe('layout', () => {
     branch: 'feature/statusbar-git-row-with-pull-request-link',
     upstream: { ahead: 3, behind: 0 },
     changes: { ...NONE, staged: 1, modified: 2 },
-    pr: { number: 12, url: PR_URL, state: 'merged' },
   }
   const gitRowOf = (columns: number, git: StatusbarGit = GIT) => layoutRows({ ...SNAPSHOT, git }, columns).at(-1) ?? []
 
   test('the git row reads like the starship prompt and shortens the branch when narrow', () => {
     const wide = gitRowOf(200)
-    expect(textOfRow(wide)).toBe('my-claude/fix-bar · feature/statusbar-git-row-with-pull-request-link · !2+1⇡3 · PR #12 merged')
-    // 프롬프트와 같은 색: 경로 하늘색, 브랜치 회색, 상태 노랑. PR 번호는 상태 색에 밑줄 친 링크.
+    expect(textOfRow(wide)).toBe('my-claude/fix-bar · feature/statusbar-git-row-with-pull-request-link · !2+1⇡3')
+    // 프롬프트와 같은 색: 경로 하늘색, 브랜치 회색, 상태 노랑.
     const styleOf = (text: string) => wide.find(part => part.text === text)?.style
     expect(styleOf('my-claude/fix-bar')).toEqual({ color: '#57C7FF', bold: true })
     expect(styleOf('feature/statusbar-git-row-with-pull-request-link')).toEqual({ color: 'gray', bold: true })
     expect(styleOf('!2+1⇡3')).toEqual({ color: 'yellow' })
-    expect(styleOf('#12')).toEqual({ color: 'merged', bold: true, underline: true })
-    expect(wide.filter(part => part.href === PR_URL).map(part => part.text)).toEqual(['PR ', '#12', ' merged'])
-    expect(textOfRow(gitRowOf(90))).toBe('my-claude/fix-bar · feature/statusbar-git-row-with-pull-request-link · !2+1⇡3 · PR #12')
     for (const columns of [70, 60, 50]) {
       const row = textOfRow(gitRowOf(columns))
       expect(displayWidth(row)).toBe(columns)
       expect(row).toStartWith('my-claude/fix-bar · feature/')
-      expect(row).toEndWith('… · !2+1⇡3 · PR #12')
+      expect(row).toEndWith('… · !2+1⇡3')
     }
     // 깨끗하고 upstream과 같으면 경로와 브랜치만, HEAD가 떨어지면 (커밋).
     expect(textOfRow(gitRowOf(200, { project: 'my-claude', branch: 'main', upstream: { ahead: 0, behind: 0 }, changes: NONE }))).toBe(
@@ -1095,23 +998,6 @@ describe('formatting', () => {
       commit: '1234567',
       changes: none,
     })
-  })
-
-  test('the PR of gh pr list: the newest whose head is the origin owner', () => {
-    expect(pullRequestOf([], 'DevooKim')).toBeUndefined()
-    expect(pullRequestOf([prRow(3, PR_URL, 'OPEN')], 'devookim')).toEqual({ number: 3, url: PR_URL, state: 'open' })
-    expect(pullRequestOf([prRow(9, PR_URL, 'OPEN', false, 'stranger')], 'DevooKim')).toBeUndefined()
-    expect(pullRequestOf([prRow(3, PR_URL, 'OPEN', true)], 'DevooKim')?.state).toBe('draft')
-    expect(pullRequestOf([prRow(3, PR_URL, 'MERGED')], 'DevooKim')?.state).toBe('merged')
-    expect(pullRequestOf([prRow(3, PR_URL, 'CLOSED')], 'DevooKim')?.state).toBe('closed')
-  })
-
-  test('the owner of the origin remote', () => {
-    expect(remoteOwner(REMOTE)).toBe('DevooKim')
-    expect(remoteOwner('git@github.com:DevooKim/my-claude.git')).toBe('DevooKim')
-    expect(remoteOwner('ssh://git@github.com/DevooKim/my-claude')).toBe('DevooKim')
-    expect(remoteOwner('https://ghe.example.com/team/app/')).toBe('team')
-    expect(remoteOwner(null)).toBeUndefined()
   })
 
   test('TaskList replaces the list and keeps what TaskCreate said', () => {

@@ -21,7 +21,7 @@ Claude Code 프롬프트에서:
 
 ```
 ✻ Opus 5.5  ●●●○○ high · C ━━━━━━━─── 71%  715k/1M · S ━───────── 13%  ↻3h35m   W ━───────── 4%  ↻5d
-my-claude/fix-bar · worktree-fix-bar · !3+2?1⇡1 · PR #12
+my-claude/fix-bar · worktree-fix-bar · !3+2?1⇡1
 ● Explore · Find the auth code 1m12s  │  T ●●●●○○○ 3/7  Running tests
 ```
 
@@ -36,11 +36,10 @@ git 줄은 starship 프롬프트와 같은 기호와 색으로 그려 셸 프롬
 
 git 줄 (저장소 안에서만)
 
-- `프로젝트[/워크트리] · 브랜치 · 상태 · PR #번호`를 `·`로 나눠 이어 씀. 경로는 굵은 하늘색(`#57C7FF`), 브랜치는 굵은 회색, 상태는 노랑
+- `프로젝트[/워크트리] · 브랜치 · 상태`를 `·`로 나눠 이어 씀. 경로는 굵은 하늘색(`#57C7FF`), 브랜치는 굵은 회색, 상태는 노랑
 - 상태 기호(starship `git_status`와 같음): `=` 충돌, `$` 스태시, `×` 삭제, `»` 이름 바꿈, `!` 수정, `+` 스테이징, `?` 추적 안 함, `⇡` 앞섬, `⇣` 뒤처짐. 깨끗하고 upstream과 같으면 아무것도 없음
 - HEAD가 떨어지면 브랜치 자리에 `(커밋)`, 리베이스·병합·체리픽·revert·bisect 중이면 `(REBASING)`처럼 표시
-- 브랜치의 PR 번호(`gh` 로그인 필요): 누르면 기본 브라우저로 PR 페이지가 열림(전체 화면 모드에서 클릭). 초록 열림, 회색 draft, 보라 merged, 빨강 closed. Claude Code의 PR 표시와 겹치면 `/config`의 Show PR status footer를 끄면 됨
-- 파일을 바꾸는 도구가 끝날 때마다, 그리고 15초마다 다시 읽음. PR은 브랜치가 바뀌거나 푸시·PR 명령 뒤 곧바로, 그 밖에는 5분마다
+- 파일을 바꾸는 도구가 끝날 때마다, 그리고 15초마다 다시 읽음. PR은 Claude Code의 PR 표시(`/config` Show PR status footer)를 씀
 
 에이전트·할 일 줄 (보일 것이 있을 때만)
 

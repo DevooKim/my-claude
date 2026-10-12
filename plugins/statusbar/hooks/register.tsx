@@ -20,7 +20,6 @@ import type {
   StatusbarFable,
   StatusbarGit,
   StatusbarGitOperation,
-  StatusbarPullRequest,
   StatusbarSnapshot,
   StatusbarTodo,
   StatusbarWindow,
@@ -41,12 +40,6 @@ const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max']
 // git은 파일을 바꾸는 도구가 끝날 때마다, 그리고 바깥(다른 터미널)에서 바꾼 것도 잡도록 주기적으로 읽는다.
 const GIT_TICK_MS = 15_000
 const GIT_TIMEOUT_MS = 10_000
-// PR은 브랜치가 바뀌거나 푸시·PR 명령이 돌면 곧바로, 아니면 5분마다 gh로 다시 묻는다.
-const PR_REFRESH_MS = 5 * 60_000
-const PR_TIMEOUT_MS = 15_000
-// --head는 브랜치 이름만 맞춰 남의 포크에서 온 같은 이름의 PR도 준다: 넉넉히 받아 소유자로 거른다.
-const PR_LIST_LIMIT = 20
-const PR_COMMAND = /\b(?:gh\s+pr|git\s+push)\b/
 // 에이전트가 도는 동안만 1초마다 목록을 다시 읽고 경과 시간을 다시 그린다.
 const AGENT_TICK_MS = 1000
 const ACTIVE_AGENT_STATUSES: ReadonlySet<string> = new Set(['pending', 'running', 'waiting'])
@@ -131,12 +124,6 @@ const PATH_COLOR = '#57C7FF'
 const BRANCH_COLOR = 'gray'
 const COMMIT_COLOR = 'green'
 const GIT_STATUS_COLOR = 'yellow'
-const PR_COLORS: Readonly<Record<StatusbarPullRequest['state'], string>> = {
-  open: 'success',
-  draft: 'inactive',
-  merged: 'merged',
-  closed: 'error',
-}
 const MIN_BRANCH_COLUMNS = 12
 // 활동 줄: 에이전트마다 1초에 한 번 숨 쉬는 점, 할 일은 하나에 점 하나(끝냄·진행 중·남음).
 const BREATH = ['●', '•', '·', '•']
@@ -169,13 +156,6 @@ type State = {
   queue: Promise<void>
   isQueued: boolean
   git: StatusbarGit | undefined
-  // 지금 브랜치의 PR을 찾는 열쇠(저장소 뿌리·origin 소유자·브랜치). 원격이 없거나 HEAD가 떨어지면 없다.
-  prKey: string | undefined
-  pr: { key: string; value?: StatusbarPullRequest; fetchedAt: number } | undefined
-  isPrStale: boolean
-  isPrFetching: boolean
-  prRetryAt: number
-  prFailures: number
   gitTicker: Timer | undefined
   gitQueue: Promise<void>
   isGitQueued: boolean
@@ -184,16 +164,11 @@ type State = {
   todos: StatusbarTodo[]
 }
 
-type GitReading = { root: string; remote: string | null; git: StatusbarGit }
-// PR을 찾을 브랜치와, 그 브랜치를 올린 저장소(origin)의 소유자.
-type PullRequestTarget = { key: string; branch: string; owner: string }
-
 // 애니메이션의 현재 칸. 움직임을 줄인 설정이면 undefined로 멈춘 모습을 그린다.
 type Frame = number | undefined
 
-export type SpanStyle = { color?: string; dimColor?: boolean; bold?: boolean; italic?: boolean; underline?: boolean }
-// href가 있으면 그 글자들을 누를 수 있는 링크로 그린다.
-export type Span = { text: string; style?: SpanStyle; href?: string }
+export type SpanStyle = { color?: string; dimColor?: boolean; bold?: boolean }
+export type Span = { text: string; style?: SpanStyle }
 
 type Variant = { rows: 'one' | 'two' | 'stack'; bar: number; extras: boolean }
 type ResetStyle = 'minutes' | 'hours'
@@ -244,12 +219,6 @@ export const register: Register = on => {
     queue: Promise.resolve(),
     isQueued: false,
     git: undefined,
-    prKey: undefined,
-    pr: undefined,
-    isPrStale: false,
-    isPrFetching: false,
-    prRetryAt: 0,
-    prFailures: 0,
     gitTicker: undefined,
     gitQueue: Promise.resolve(),
     isGitQueued: false,
@@ -356,69 +325,27 @@ export const register: Register = on => {
 
       return own
     }
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const { Box, Text } = $.ui.resolve(e)
     const columns = Math.max(MIN_COLUMNS, (e.viewport?.columns ?? FALLBACK_COLUMNS) - FOOTER_INSET)
     const now = await $.clock.now()
     const frame = state.isReducedMotion ? undefined : Math.floor(now / FRAME_MS)
-    const draw = (part: Span) =>
-      part.style === undefined ? part.text : <Text {...part.style}>{part.text}</Text>
-    // href가 있는 조각은 누르면 그 주소를 브라우저로 여는 버튼이다. 링크(OSC 8)는 터미널에 따라
-    // 주소를 글자로 덧붙이므로 쓰지 않는다. 버튼은 Text 안에 못 들어가 그런 줄은 가로 Box로 그린다.
-    const drawRow = (row: Span[]) => {
-      const runs = linkRuns(row)
-      if (runs.every(run => run.href === undefined)) return <Text wrap="truncate-end">{row.map(draw)}</Text>
-
-      return (
-        <Box flexDirection="row">
-          {runs.map(run => {
-            const { href } = run
-            if (href === undefined) return <Text>{run.parts.map(draw)}</Text>
-
-            return (
-              <Button plain key={`open:${href}`} onPress={() => void openPage($, href)}>
-                {run.parts.map(draw)}
-              </Button>
-            )
-          })}
-        </Box>
-      )
-    }
 
     // 엔진의 힌트 줄 아래 ROW_GAP 줄을 띄우고 상태 줄을 그린다.
     return (
       <Box flexDirection="column">
         {own}
         <Box flexDirection="column" marginTop={ROW_GAP}>
-          {layoutRows(snapshot, columns, frame, now).map(drawRow)}
+          {layoutRows(snapshot, columns, frame, now).map(row => (
+            <Text wrap="truncate-end">
+              {row.map(part =>
+                part.style === undefined ? part.text : <Text {...part.style}>{part.text}</Text>,
+              )}
+            </Text>
+          ))}
         </Box>
       </Box>
     )
   })
-}
-
-// 주소를 기본 브라우저로 연다: macOS는 open, 그 밖은 xdg-open.
-async function openPage($: EngineInterface, url: string): Promise<void> {
-  for (const opener of ['open', 'xdg-open']) {
-    try {
-      const { exitCode } = await $.process.run([opener, url])
-      if (exitCode === 0) return
-    } catch {
-      // 다음 방법으로 넘어간다.
-    }
-  }
-  $.ui.log(`statusbar: could not open ${url}`, { to: 'debug' })
-}
-
-// 이어진 조각을 href별로 묶는다: 같은 href끼리, href 없는 것끼리.
-function linkRuns(row: readonly Span[]): { href?: string; parts: Span[] }[] {
-  const runs: { href?: string; parts: Span[] }[] = []
-  for (const part of row) {
-    const last = runs.at(-1)
-    if (last !== undefined && last.href === part.href) last.parts.push(part)
-    else runs.push(part.href === undefined ? { parts: [part] } : { href: part.href, parts: [part] })
-  }
-
-  return runs
 }
 
 async function restore($: EngineInterface, state: State): Promise<void> {
@@ -591,7 +518,7 @@ function snapshotOf(
   const fiveHour = pickWindow(usage.rateLimits, 'five_hour') ?? state.seed.fiveHour
   const sevenDay = pickWindow(usage.rateLimits, 'seven_day') ?? state.seed.sevenDay
 
-  const git = gitOf(state)
+  const { git } = state
 
   return {
     model,
@@ -665,15 +592,6 @@ async function fetchPlanUsage($: EngineInterface, state: State, now: number): Pr
   }
 }
 
-// 지금 브랜치의 PR을 찾았으면 git 값에 붙인다. 다시 불러온 직후(prKey 전)는 되살린 그대로 둔다.
-function gitOf(state: State): StatusbarGit | undefined {
-  const { git, pr, prKey } = state
-  if (git === undefined || prKey === undefined) return git
-  const { pr: _previous, ...reading } = git
-
-  return pr?.key === prKey && pr.value !== undefined ? { ...reading, pr: pr.value } : reading
-}
-
 function refreshGit($: EngineInterface, state: State): Promise<void> {
   if (!state.isLive) return Promise.resolve()
   if (state.isGitQueued) return state.gitQueue
@@ -689,18 +607,7 @@ function refreshGit($: EngineInterface, state: State): Promise<void> {
 
 async function runGitRefresh($: EngineInterface, state: State): Promise<void> {
   try {
-    const [reading, now] = await Promise.all([readGit($), $.clock.now()])
-    const previous = state.git
-    const target = pullRequestTargetOf(reading)
-    state.git = reading?.git
-    state.prKey = target?.key
-    // 다시 불러온 뒤 처음 읽을 때는 되살린 PR을 같은 브랜치에 붙여 두고 곧 다시 묻는다.
-    if (state.pr === undefined && target !== undefined && previous?.pr && previous.branch === target.branch) {
-      state.pr = { key: target.key, value: previous.pr, fetchedAt: Number.NEGATIVE_INFINITY }
-    }
-    if (target !== undefined && isPullRequestDue(state, now)) {
-      void fetchPullRequest($, state, target, now).then(() => schedule($, state))
-    }
+    state.git = await readGit($)
     schedule($, state)
   } catch (error) {
     // 잠깐의 실패(시간 초과 등)로 줄이 깜빡이지 않도록 마지막 값을 둔다.
@@ -710,7 +617,7 @@ async function runGitRefresh($: EngineInterface, state: State): Promise<void> {
 
 // 저장소 밖이거나 git이 상태를 못 읽으면 undefined: git 줄을 그리지 않는다. 다른 git 명령과
 // index.lock을 다투지 않도록 선택적 잠금을 끄고 읽는다.
-async function readGit($: EngineInterface): Promise<GitReading | undefined> {
+async function readGit($: EngineInterface): Promise<StatusbarGit | undefined> {
   const repo = await $.session.repo()
   if (repo === null) return undefined
   const [status, paths] = await Promise.all([
@@ -726,14 +633,10 @@ async function readGit($: EngineInterface): Promise<GitReading | undefined> {
   const operation = gitDir === '' ? undefined : await operationIn($, gitDir)
 
   return {
-    root: repo.root,
-    remote: repo.remote,
-    git: {
-      project: baseName(repo.root),
-      ...(isWorktree ? { worktree: baseName(top) } : {}),
-      ...(operation !== undefined ? { operation } : {}),
-      ...gitStatusOf(status),
-    },
+    project: baseName(repo.root),
+    ...(isWorktree ? { worktree: baseName(top) } : {}),
+    ...(operation !== undefined ? { operation } : {}),
+    ...gitStatusOf(status),
   }
 }
 
@@ -765,7 +668,7 @@ async function operationIn($: EngineInterface, gitDir: string): Promise<Statusba
 
 // `git status --porcelain=v2 --branch --show-stash`를 starship의 git_status처럼 센다. 각 항목의 XY는
 // 스테이징(X)과 작업 트리(Y)의 상태다.
-export function gitStatusOf(text: string): Omit<StatusbarGit, 'project' | 'worktree' | 'operation' | 'pr'> {
+export function gitStatusOf(text: string): Omit<StatusbarGit, 'project' | 'worktree' | 'operation'> {
   const changes = { conflicted: 0, stashed: 0, deleted: 0, renamed: 0, modified: 0, staged: 0, untracked: 0 }
   let oid = ''
   let head = ''
@@ -793,79 +696,6 @@ export function gitStatusOf(text: string): Omit<StatusbarGit, 'project' | 'workt
     ...(upstream ? { upstream } : {}),
     changes,
   }
-}
-
-function isPullRequestDue(state: State, now: number): boolean {
-  const { prKey, pr } = state
-  if (prKey === undefined || state.isPrFetching || now < state.prRetryAt) return false
-
-  return pr?.key !== prKey || state.isPrStale || now - pr.fetchedAt >= PR_REFRESH_MS
-}
-
-// 원격이 있고 브랜치 위에 있을 때만 PR을 찾는다.
-function pullRequestTargetOf(reading: GitReading | undefined): PullRequestTarget | undefined {
-  const branch = reading?.git.branch
-  const owner = remoteOwner(reading?.remote ?? null)
-  if (reading === undefined || branch === undefined || owner === undefined) return undefined
-
-  return { key: `${reading.root}\n${owner}\n${branch}`, branch, owner }
-}
-
-// https://github.com/<owner>/<repo>.git, git@github.com:<owner>/<repo>.git, ssh://git@host/<owner>/<repo>.
-export function remoteOwner(remote: string | null): string | undefined {
-  const match = remote === null ? null : /[/:]([^/:]+)\/[^/:]+?(?:\.git)?\/?$/.exec(remote)
-
-  return match?.[1]
-}
-
-// 지금 브랜치를 head로 하고 그 head가 origin 소유자의 것인 PR 가운데 가장 최근 것(닫힌 것·병합된
-// 것 포함). gh가 없거나 로그인 전이거나 GitHub 저장소가 아니면 실패로 보고 물러났다가 다시 묻는다.
-async function fetchPullRequest($: EngineInterface, state: State, target: PullRequestTarget, now: number): Promise<void> {
-  state.isPrFetching = true
-  state.isPrStale = false
-  try {
-    const { exitCode, stdout, stderr } = await $.process.run(
-      [
-        'gh',
-        'pr',
-        'list',
-        '--head',
-        target.branch,
-        '--state',
-        'all',
-        '--limit',
-        String(PR_LIST_LIMIT),
-        '--json',
-        'number,url,state,isDraft,headRepositoryOwner',
-      ],
-      { timeoutMs: PR_TIMEOUT_MS, env: { GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' } },
-    )
-    if (exitCode !== 0) throw new Error(stderr.trim().split('\n')[0] || `gh exited ${exitCode}`)
-    const value = pullRequestOf(JSON.parse(stdout), target.owner)
-    state.pr = { key: target.key, fetchedAt: now, ...(value ? { value } : {}) }
-    state.prFailures = 0
-    state.prRetryAt = 0
-  } catch (error) {
-    state.prFailures += 1
-    state.prRetryAt = now + Math.min(BACKOFF_MS * 2 ** (state.prFailures - 1), BACKOFF_CAP_MS)
-    $.ui.log(`statusbar: pull request not read: ${describe(error)}`, { to: 'debug' })
-  } finally {
-    state.isPrFetching = false
-  }
-}
-
-export function pullRequestOf(rows: unknown, owner: string): StatusbarPullRequest | undefined {
-  const isOwners = (row: Json) => {
-    const head = row.headRepositoryOwner
-
-    return isRecord(head) && typeof head.login === 'string' && head.login.toLowerCase() === owner.toLowerCase()
-  }
-  const row = (Array.isArray(rows) ? rows.filter(isRecord) : []).find(isOwners)
-  if (row === undefined || typeof row.number !== 'number' || typeof row.url !== 'string') return undefined
-  const state =
-    row.state === 'MERGED' ? 'merged' : row.state === 'CLOSED' ? 'closed' : row.isDraft === true ? 'draft' : 'open'
-
-  return { number: row.number, url: row.url, state }
 }
 
 // 도는(대기 포함) 에이전트만 남긴다. 처음 본 시각을 지켜 경과 시간이 이어지게 한다.
@@ -913,12 +743,6 @@ export function agentLabel(agent: Pick<AgentInfo, 'type' | 'name' | 'teammateId'
 
 function noteTool($: EngineInterface, state: State, e: ToolCallInput, result: ToolCallResult): void {
   try {
-    // PR이나 푸시 명령은 실패로 끝나도(가령 gh가 GitHub 오류를 받고도 PR은 만들어짐) PR을 곧바로 다시 묻는다.
-    if (e.tool === 'Bash' && PR_COMMAND.test(e.command)) {
-      state.isPrStale = true
-      state.prRetryAt = 0
-      $.clock.after(0, () => void refreshGit($, state))
-    }
     if (result.deny !== undefined || result.isError === true) return
     const tool = String(e.tool)
     // TodoWrite는 에이전트마다 따로 목록을 두므로 메인의 것만, 작업(Task*)은 함께 쓰는 목록이라 모두 읽는다.
@@ -930,12 +754,6 @@ function noteTool($: EngineInterface, state: State, e: ToolCallInput, result: To
       }
 
       return
-    }
-    // 푸시나 PR 명령 뒤에는 PR을 기다리지 않고 다시 묻는다.
-    const operation = isRecord(result.result) ? result.result.gitOperation : undefined
-    if (isRecord(operation) && (operation.pr !== undefined || operation.push !== undefined)) {
-      state.isPrStale = true
-      state.prRetryAt = 0
     }
     if (result.isReadOnly !== true) $.clock.after(0, () => void refreshGit($, state))
   } catch (error) {
@@ -1064,21 +882,19 @@ function usageRows(snapshot: StatusbarSnapshot, columns: number, frame: Frame): 
   return rows
 }
 
-// 셸 프롬프트처럼 이어 쓰고 · 로 나눈다: 프로젝트[/워크트리] · 브랜치 (진행 중 작업) · 상태 · PR #번호.
-// 넘치면 PR 상태 말을 빼고, 그래도 넘치면 브랜치 이름을 줄인다.
+// 셸 프롬프트처럼 이어 쓰고 · 로 나눈다: 프로젝트[/워크트리] · 브랜치 (진행 중 작업) · 상태.
+// 넘치면 브랜치 이름을 줄인다.
 function gitRows(git: StatusbarGit | undefined, columns: number): Span[][] {
   if (git === undefined) return []
-  const full = gitSpans(git, true)
-  if (widthOf(full) <= columns) return [full]
-  const compact = gitSpans(git, false)
-  const overflow = widthOf(compact) - columns
-  if (overflow <= 0) return [compact]
+  const full = gitSpans(git)
+  const overflow = widthOf(full) - columns
+  if (overflow <= 0) return [full]
   const head = git.branch ?? git.commit ?? '?'
 
-  return [gitSpans(git, false, Math.max(MIN_BRANCH_COLUMNS, displayWidth(head) - overflow))]
+  return [gitSpans(git, Math.max(MIN_BRANCH_COLUMNS, displayWidth(head) - overflow))]
 }
 
-function gitSpans(git: StatusbarGit, isDetailed: boolean, branchColumns = Number.POSITIVE_INFINITY): Span[] {
+function gitSpans(git: StatusbarGit, branchColumns = Number.POSITIVE_INFINITY): Span[] {
   const place = git.worktree === undefined ? git.project : `${git.project}/${git.worktree}`
   const status = gitStatusText(git)
   const groups = [
@@ -1093,7 +909,6 @@ function gitSpans(git: StatusbarGit, isDetailed: boolean, branchColumns = Number
         : [span(` (${git.operation.toUpperCase()})`, { color: GIT_STATUS_COLOR, bold: true })]),
     ],
     status === '' ? [] : [span(status, { color: GIT_STATUS_COLOR })],
-    pullRequestSpans(git.pr, isDetailed),
   ]
 
   return joinSpans(
@@ -1122,17 +937,6 @@ export function gitStatusText(git: Pick<StatusbarGit, 'changes' | 'upstream'>): 
     ...(ahead > 0 ? [`⇡${ahead}`] : []),
     ...(behind > 0 ? [`⇣${behind}`] : []),
   ].join('')
-}
-
-// PR 번호는 누르면 PR 페이지가 열리는 버튼이라 밑줄을 긋는다. 열린 PR이 아니면 상태를 덧붙인다.
-function pullRequestSpans(pr: StatusbarPullRequest | undefined, isDetailed: boolean): Span[] {
-  if (pr === undefined) return []
-
-  return [
-    span('PR ', { color: MUTED }, pr.url),
-    span(`#${pr.number}`, { color: PR_COLORS[pr.state], bold: true, underline: true }, pr.url),
-    ...(isDetailed && pr.state !== 'open' ? [span(` ${pr.state}`, { color: MUTED, italic: true }, pr.url)] : []),
-  ]
 }
 
 function activityRows(snapshot: StatusbarSnapshot, columns: number, now: number, frame: Frame): Span[][] {
@@ -1382,8 +1186,8 @@ function meter(
   ]
 }
 
-function span(text: string, style?: SpanStyle, href?: string): Span {
-  return { text, ...(style !== undefined ? { style } : {}), ...(href !== undefined ? { href } : {}) }
+function span(text: string, style?: SpanStyle): Span {
+  return style === undefined ? { text } : { text, style }
 }
 
 function joinSpans(groups: readonly Span[][], separator: readonly Span[]): Span[] {

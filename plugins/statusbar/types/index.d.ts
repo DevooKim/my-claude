@@ -10,12 +10,6 @@ export type StatusbarFable =
   | { kind: 'absent' }
   | { kind: 'reading'; window: StatusbarWindow }
 
-export type StatusbarPullRequest = {
-  number: number
-  url: string
-  state: 'open' | 'draft' | 'merged' | 'closed'
-}
-
 export type StatusbarGitOperation = 'rebasing' | 'merging' | 'cherry-picking' | 'reverting' | 'bisecting'
 
 // starship의 git_status가 세는 것과 같다: 스태시 수, 그리고 바뀐 파일을 종류별로.
@@ -39,7 +33,6 @@ export type StatusbarGit = {
   operation?: StatusbarGitOperation
   upstream?: { ahead: number; behind: number }
   changes: StatusbarGitChanges
-  pr?: StatusbarPullRequest
 }
 
 // 지금 도는 에이전트 하나. startedAt은 상태 줄이 처음 본 시각이다.
