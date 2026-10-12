@@ -46,6 +46,7 @@ const PR_REFRESH_MS = 5 * 60_000
 const PR_TIMEOUT_MS = 15_000
 // --head는 브랜치 이름만 맞춰 남의 포크에서 온 같은 이름의 PR도 준다: 넉넉히 받아 소유자로 거른다.
 const PR_LIST_LIMIT = 20
+const PR_COMMAND = /\b(?:gh\s+pr|git\s+push)\b/
 // 에이전트가 도는 동안만 1초마다 목록을 다시 읽고 경과 시간을 다시 그린다.
 const AGENT_TICK_MS = 1000
 const ACTIVE_AGENT_STATUSES: ReadonlySet<string> = new Set(['pending', 'running', 'waiting'])
@@ -885,6 +886,12 @@ export function agentLabel(agent: Pick<AgentInfo, 'type' | 'name' | 'teammateId'
 
 function noteTool($: EngineInterface, state: State, e: ToolCallInput, result: ToolCallResult): void {
   try {
+    // PR이나 푸시 명령은 실패로 끝나도(가령 gh가 GitHub 오류를 받고도 PR은 만들어짐) PR을 곧바로 다시 묻는다.
+    if (e.tool === 'Bash' && PR_COMMAND.test(e.command)) {
+      state.isPrStale = true
+      state.prRetryAt = 0
+      $.clock.after(0, () => void refreshGit($, state))
+    }
     if (result.deny !== undefined || result.isError === true) return
     const tool = String(e.tool)
     // TodoWrite는 에이전트마다 따로 목록을 두므로 메인의 것만, 작업(Task*)은 함께 쓰는 목록이라 모두 읽는다.

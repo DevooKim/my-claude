@@ -123,6 +123,7 @@ type World = {
   env: Record<string, string>
   repo?: Repo
   isFsRefused: boolean
+  isBashFailing: boolean
   prs: unknown[]
   agents: AgentInfo[]
   messages: SessionMessage[]
@@ -138,6 +139,7 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
     settings: {},
     env: {},
     isFsRefused: false,
+    isBashFailing: false,
     prs: [],
     agents: [],
     messages: [],
@@ -226,6 +228,8 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
       return { result: { task: { id: String(tasks.count), subject: e.subject } } }
     }
     if (e.tool === 'TaskUpdate') return { result: { success: true, taskId: e.taskId, updatedFields: ['status'] } }
+
+    if (world.isBashFailing) return { isError: true as const, result: 'GraphQL: Something went wrong', text: 'GraphQL: Something went wrong' }
 
     return { result: world.bash }
   })
@@ -658,6 +662,23 @@ describe('git row', () => {
     expect(asked()).toBe(2)
     await clock.advance(MINUTE)
     expect(asked()).toBe(3)
+  })
+
+  test('a PR command that fails after GitHub made the PR still asks gh again', async ($, on) => {
+    const repo: Repo = { root: ROOT, remote: REMOTE, status: porcelain(`# branch.oid ${OID}`, '# branch.head topic') }
+    const { clock, runs, world } = setUp(on, { model: 'claude-opus-5-5', repo })
+    const asked = () => runs.filter(argv => argv[0] === 'gh').length
+
+    await $.session.start(START)
+    await clock.settle()
+    expect(asked()).toBe(1)
+
+    world.prs = [prRow(1, PR_URL, 'OPEN')]
+    world.isBashFailing = true
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --title x --body-file -', description: 'Open a PR' })
+    await clock.settle()
+    expect(asked()).toBe(2)
+    expect(await bar($)).toEqual([OPUS_ROW, 'my-claude topic PR #1'])
   })
 
   test('a change from another terminal shows on the next poll', async ($, on) => {
