@@ -627,6 +627,12 @@ async function runGitRefresh($: EngineInterface, state: State): Promise<void> {
   try {
     const [reading, now] = await Promise.all([readGit($), $.clock.now()])
     const target = pullRequestTargetOf(reading)
+    // 다른 터미널에서 push·pull해도 upstream과의 차이(⇡⇣)가 바뀌므로 PR 상태를 곧바로 다시 묻는다.
+    const previous = state.git
+    if (previous !== undefined && JSON.stringify(previous.upstream) !== JSON.stringify(reading?.git.upstream)) {
+      state.isPrStale = true
+      state.prRetryAt = 0
+    }
     state.git = reading?.git
     state.prKey = target?.key
     if (target !== undefined && isPullRequestDue(state, now)) {

@@ -676,6 +676,24 @@ describe('git row', () => {
     expect((await bar($))[1]).toBe('my-claude · topic · PR #1')
   })
 
+  test('a push or pull from another terminal asks for the PR state on the next poll', async ($, on) => {
+    const ahead = (count: number) =>
+      porcelain(`# branch.oid ${OID}`, '# branch.head topic', '# branch.upstream origin/topic', `# branch.ab +${count} -0`)
+    const repo: Repo = { root: ROOT, remote: REMOTE, status: ahead(2) }
+    const { clock, runs } = setUp(on, { model: 'claude-opus-5-5', repo, prs: [prRow({})] })
+    const asked = () => runs.filter(argv => argv[0] === 'gh').length
+
+    await $.session.start(START)
+    await clock.settle()
+    expect(asked()).toBe(1)
+    await clock.advance(15_000)
+    expect(asked()).toBe(1)
+
+    repo.status = ahead(0)
+    await clock.advance(15_000)
+    expect(asked()).toBe(2)
+  })
+
   test('a change from another terminal shows on the next poll', async ($, on) => {
     const repo: Repo = { root: ROOT, remote: null, status: porcelain(`# branch.oid ${OID}`, '# branch.head main') }
     const { clock } = setUp(on, { model: 'claude-opus-5-5', repo })
