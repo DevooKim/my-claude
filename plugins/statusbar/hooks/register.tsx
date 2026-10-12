@@ -904,11 +904,12 @@ function gitSpans(git: StatusbarGit, hasPr: boolean, branchColumns = Number.POSI
   )
 }
 
-// PR 번호는 상태 색으로 칠하고, 누르면 PR 페이지가 열린다.
+// PR 번호만 상태 색으로 칠하고, 누르면 PR 페이지가 열린다.
 function pullRequestSpans(pr: StatusbarPullRequest): Span[] {
-  const color = pullRequestColor(pr)
-
-  return [span('PR ', { color }, pr.url), span(`#${pr.number}`, { color, bold: true, underline: true }, pr.url)]
+  return [
+    span('PR ', { color: MUTED }, pr.url),
+    span(`#${pr.number}`, { color: pullRequestColor(pr), bold: true, underline: true }, pr.url),
+  ]
 }
 
 // starship의 $all_status$ahead_behind와 같은 순서·기호로 붙여 쓴다. 깨끗하고 upstream과 같으면 빈 글자.
