@@ -356,38 +356,65 @@ export const register: Register = on => {
 
       return own
     }
-    const { Box, Text, Link } = $.ui.resolve(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
     const columns = Math.max(MIN_COLUMNS, (e.viewport?.columns ?? FALLBACK_COLUMNS) - FOOTER_INSET)
     const now = await $.clock.now()
     const frame = state.isReducedMotion ? undefined : Math.floor(now / FRAME_MS)
     const draw = (part: Span) =>
       part.style === undefined ? part.text : <Text {...part.style}>{part.text}</Text>
+    // href가 있는 조각은 누르면 그 주소를 브라우저로 여는 버튼이다. 링크(OSC 8)는 터미널에 따라
+    // 주소를 글자로 덧붙이므로 쓰지 않는다. 버튼은 Text 안에 못 들어가 그런 줄은 가로 Box로 그린다.
+    const drawRow = (row: Span[]) => {
+      const runs = linkRuns(row)
+      if (runs.every(run => run.href === undefined)) return <Text wrap="truncate-end">{row.map(draw)}</Text>
 
-    // 엔진의 힌트 줄 아래 ROW_GAP 줄을 띄우고 상태 줄을 그린다. 같은 href가 이어진 글자들은
-    // 한 링크로 묶어 어디를 눌러도 같은 곳이 열리게 한다.
+      return (
+        <Box flexDirection="row">
+          {runs.map(run => {
+            const { href } = run
+            if (href === undefined) return <Text>{run.parts.map(draw)}</Text>
+
+            return (
+              <Button plain key={`open:${href}`} onPress={() => void openPage($, href)}>
+                {run.parts.map(draw)}
+              </Button>
+            )
+          })}
+        </Box>
+      )
+    }
+
+    // 엔진의 힌트 줄 아래 ROW_GAP 줄을 띄우고 상태 줄을 그린다.
     return (
       <Box flexDirection="column">
         {own}
         <Box flexDirection="column" marginTop={ROW_GAP}>
-          {layoutRows(snapshot, columns, frame, now).map(row => (
-            <Text wrap="truncate-end">
-              {linkRuns(row).map(run =>
-                run.href === undefined ? draw(run.parts[0] ?? span('')) : <Link href={run.href}>{run.parts.map(draw)}</Link>,
-              )}
-            </Text>
-          ))}
+          {layoutRows(snapshot, columns, frame, now).map(drawRow)}
         </Box>
       </Box>
     )
   })
 }
 
-// 이어진 같은 href의 조각을 하나로 묶는다. href가 없는 조각은 하나씩 따로 둔다.
+// 주소를 기본 브라우저로 연다: macOS는 open, 그 밖은 xdg-open.
+async function openPage($: EngineInterface, url: string): Promise<void> {
+  for (const opener of ['open', 'xdg-open']) {
+    try {
+      const { exitCode } = await $.process.run([opener, url])
+      if (exitCode === 0) return
+    } catch {
+      // 다음 방법으로 넘어간다.
+    }
+  }
+  $.ui.log(`statusbar: could not open ${url}`, { to: 'debug' })
+}
+
+// 이어진 조각을 href별로 묶는다: 같은 href끼리, href 없는 것끼리.
 function linkRuns(row: readonly Span[]): { href?: string; parts: Span[] }[] {
   const runs: { href?: string; parts: Span[] }[] = []
   for (const part of row) {
     const last = runs.at(-1)
-    if (part.href !== undefined && last?.href === part.href) last.parts.push(part)
+    if (last !== undefined && last.href === part.href) last.parts.push(part)
     else runs.push(part.href === undefined ? { parts: [part] } : { href: part.href, parts: [part] })
   }
 
@@ -1037,7 +1064,7 @@ function usageRows(snapshot: StatusbarSnapshot, columns: number, frame: Frame): 
   return rows
 }
 
-// 셸 프롬프트처럼 한 칸씩 띄워 이어 쓴다: 프로젝트[/워크트리] 브랜치 (진행 중 작업) 상태 PR #번호.
+// 셸 프롬프트처럼 이어 쓰고 · 로 나눈다: 프로젝트[/워크트리] · 브랜치 (진행 중 작업) · 상태 · PR #번호.
 // 넘치면 PR 상태 말을 빼고, 그래도 넘치면 브랜치 이름을 줄인다.
 function gitRows(git: StatusbarGit | undefined, columns: number): Span[][] {
   if (git === undefined) return []
@@ -1056,18 +1083,22 @@ function gitSpans(git: StatusbarGit, isDetailed: boolean, branchColumns = Number
   const status = gitStatusText(git)
   const groups = [
     [span(place, { color: PATH_COLOR, bold: true })],
-    // HEAD가 떨어지면 starship의 git_commit처럼 (커밋)을 브랜치 자리에 둔다.
-    git.branch === undefined
-      ? [span(`(${git.commit ?? '?'})`, { color: COMMIT_COLOR, bold: true })]
-      : [span(fitText(git.branch, branchColumns), { color: BRANCH_COLOR, bold: true })],
-    git.operation === undefined ? [] : [span(`(${git.operation.toUpperCase()})`, { color: GIT_STATUS_COLOR, bold: true })],
+    [
+      // HEAD가 떨어지면 starship의 git_commit처럼 (커밋)을 브랜치 자리에 둔다.
+      git.branch === undefined
+        ? span(`(${git.commit ?? '?'})`, { color: COMMIT_COLOR, bold: true })
+        : span(fitText(git.branch, branchColumns), { color: BRANCH_COLOR, bold: true }),
+      ...(git.operation === undefined
+        ? []
+        : [span(` (${git.operation.toUpperCase()})`, { color: GIT_STATUS_COLOR, bold: true })]),
+    ],
     status === '' ? [] : [span(status, { color: GIT_STATUS_COLOR })],
     pullRequestSpans(git.pr, isDetailed),
   ]
 
   return joinSpans(
     groups.filter(group => group.length > 0),
-    [span(' ')],
+    [span(' '), span('·', { color: FAINT }), span(' ')],
   )
 }
 
@@ -1093,7 +1124,7 @@ export function gitStatusText(git: Pick<StatusbarGit, 'changes' | 'upstream'>): 
   ].join('')
 }
 
-// PR 번호는 누르면 PR 페이지가 열리는 링크라 밑줄을 긋는다. 열린 PR이 아니면 상태를 덧붙인다.
+// PR 번호는 누르면 PR 페이지가 열리는 버튼이라 밑줄을 긋는다. 열린 PR이 아니면 상태를 덧붙인다.
 function pullRequestSpans(pr: StatusbarPullRequest | undefined, isDetailed: boolean): Span[] {
   if (pr === undefined) return []
 

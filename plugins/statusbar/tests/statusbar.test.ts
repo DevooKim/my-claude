@@ -200,6 +200,7 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
     const [command, ...args] = e.argv
     const { repo } = world
     if (command === 'gh') return ran(0, JSON.stringify(world.prs))
+    if (command === 'open') return ran(0, '')
     if (command !== 'git' || repo === undefined) return ran(128, '', 'fatal: not a git repository')
     if (args.includes('status')) return ran(0, repo.status)
 
@@ -274,20 +275,33 @@ async function drawn(
   return tree
 }
 
-// 그린 트리의 링크마다 주소와 글자.
-async function linksOf(
+// 그린 트리의 버튼마다 주소(key)와 글자.
+async function buttonsOf(
   $: Engine,
   options: { surface?: RenderSurface } = {},
-): Promise<{ href: string; text: string }[]> {
-  const found: { href: string; text: string }[] = []
+): Promise<{ key: string; text: string }[]> {
+  const found: { key: string; text: string }[] = []
   const walk = (node: RenderElement | string): void => {
     if (typeof node === 'string') return
-    if (node.type === 'Link') found.push({ href: node.props.href, text: textOf(node) })
+    if (node.type === 'Button') found.push({ key: String(node.props.key), text: textOf(node) })
     for (const child of 'children' in node ? (node.children ?? []) : []) walk(child)
   }
   walk(await drawn($, options))
 
   return found
+}
+
+// 힌트 줄을 그린 채로 버튼 하나를 누른다.
+async function press($: Engine, key: string): Promise<void> {
+  const ui = await $.ui.mount({
+    plugin: 'statusbar',
+    surface: 'terminal',
+    component: 'PromptHint',
+    props: { isDraft: false, isWorking: false, hint: ENGINE_LINE },
+    viewport: { columns: 164, rows: 40, isFullscreen: true },
+  })
+  await ui.press({ key })
+  await ui.unmount()
 }
 
 // 프롬프트 아래 힌트 줄을 그려 줄마다의 글자를 돌려준다: 첫 줄은 엔진의 줄.
@@ -585,8 +599,8 @@ describe('git row', () => {
     await $.session.start(START)
     await clock.settle()
     for (const surface of ['terminal', 'desktop'] as const) {
-      expect(await bar($, { surface })).toEqual([OPUS_ROW, 'my-claude feature/bar !2+2?3⇡2⇣1 PR #12'])
-      expect(await linksOf($, { surface })).toEqual([{ href: PR_URL, text: 'PR #12' }])
+      expect(await bar($, { surface })).toEqual([OPUS_ROW, 'my-claude · feature/bar · !2+2?3⇡2⇣1 · PR #12'])
+      expect(await buttonsOf($, { surface })).toEqual([{ key: `open:${PR_URL}`, text: 'PR #12' }])
     }
     // git은 선택적 잠금 없이 읽어 모델의 git 명령과 index.lock을 다투지 않는다.
     expect(runs.filter(argv => argv[0] === 'git').every(argv => argv[1] === '--no-optional-locks')).toBe(true)
@@ -608,7 +622,7 @@ describe('git row', () => {
 
     await $.session.start(START)
     await clock.settle()
-    expect((await bar($))[1]).toBe('my-claude/fix-bar worktree-fix-bar')
+    expect((await bar($))[1]).toBe('my-claude/fix-bar · worktree-fix-bar')
   })
 
   test('a linked worktree, a rebase on a detached HEAD and a conflict; no PR lookup', async ($, on) => {
@@ -629,7 +643,7 @@ describe('git row', () => {
 
     await $.session.start(START)
     await clock.settle()
-    expect(await bar($)).toEqual([OPUS_ROW, 'my-claude/fix-bar (1234567) (REBASING) =1'])
+    expect(await bar($)).toEqual([OPUS_ROW, 'my-claude/fix-bar · (1234567) (REBASING) · =1'])
     expect(runs.some(argv => argv[0] === 'gh')).toBe(false)
   })
 
@@ -640,7 +654,7 @@ describe('git row', () => {
 
     await $.session.start(START)
     await clock.settle()
-    expect(await bar($)).toEqual([OPUS_ROW, 'my-claude topic'])
+    expect(await bar($)).toEqual([OPUS_ROW, 'my-claude · topic'])
     expect(asked()).toBe(1)
 
     // 모델이 푸시하고 초안 PR을 연다: Bash의 기록이 그 PR 명령을 알린다.
@@ -654,8 +668,11 @@ describe('git row', () => {
     }
     await $.tool.call({ tool: 'Bash', command: 'gh pr create --draft --fill', description: 'Open a draft PR' })
     await clock.settle()
-    expect(await bar($)).toEqual([OPUS_ROW, 'my-claude topic PR #7 draft'])
-    expect(await linksOf($)).toEqual([{ href: DRAFT_URL, text: 'PR #7 draft' }])
+    expect(await bar($)).toEqual([OPUS_ROW, 'my-claude · topic · PR #7 draft'])
+    expect(await buttonsOf($)).toEqual([{ key: `open:${DRAFT_URL}`, text: 'PR #7 draft' }])
+    // 누르면 기본 브라우저로 PR 페이지를 연다.
+    await press($, `open:${DRAFT_URL}`)
+    expect(runs.at(-1)).toEqual(['open', DRAFT_URL])
     expect(asked()).toBe(2)
 
     await clock.advance(4 * MINUTE)
@@ -678,7 +695,7 @@ describe('git row', () => {
     await $.tool.call({ tool: 'Bash', command: 'gh pr create --title x --body-file -', description: 'Open a PR' })
     await clock.settle()
     expect(asked()).toBe(2)
-    expect(await bar($)).toEqual([OPUS_ROW, 'my-claude topic PR #1'])
+    expect(await bar($)).toEqual([OPUS_ROW, 'my-claude · topic · PR #1'])
   })
 
   test('a change from another terminal shows on the next poll', async ($, on) => {
@@ -687,11 +704,11 @@ describe('git row', () => {
 
     await $.session.start(START)
     await clock.settle()
-    expect((await bar($))[1]).toBe('my-claude main')
+    expect((await bar($))[1]).toBe('my-claude · main')
 
     repo.status = porcelain(`# branch.oid ${OID}`, '# branch.head main', '? new-file.ts')
     await clock.advance(15_000)
-    expect((await bar($))[1]).toBe('my-claude main ?1')
+    expect((await bar($))[1]).toBe('my-claude · main · ?1')
     // 원격이 없으면 PR을 묻지 않는다.
     expect(runs.some(argv => argv[0] === 'gh')).toBe(false)
   })
@@ -923,7 +940,7 @@ describe('layout', () => {
 
   test('the git row reads like the starship prompt and shortens the branch when narrow', () => {
     const wide = gitRowOf(200)
-    expect(textOfRow(wide)).toBe('my-claude/fix-bar feature/statusbar-git-row-with-pull-request-link !2+1⇡3 PR #12 merged')
+    expect(textOfRow(wide)).toBe('my-claude/fix-bar · feature/statusbar-git-row-with-pull-request-link · !2+1⇡3 · PR #12 merged')
     // 프롬프트와 같은 색: 경로 하늘색, 브랜치 회색, 상태 노랑. PR 번호는 상태 색에 밑줄 친 링크.
     const styleOf = (text: string) => wide.find(part => part.text === text)?.style
     expect(styleOf('my-claude/fix-bar')).toEqual({ color: '#57C7FF', bold: true })
@@ -931,19 +948,19 @@ describe('layout', () => {
     expect(styleOf('!2+1⇡3')).toEqual({ color: 'yellow' })
     expect(styleOf('#12')).toEqual({ color: 'merged', bold: true, underline: true })
     expect(wide.filter(part => part.href === PR_URL).map(part => part.text)).toEqual(['PR ', '#12', ' merged'])
-    expect(textOfRow(gitRowOf(85))).toBe('my-claude/fix-bar feature/statusbar-git-row-with-pull-request-link !2+1⇡3 PR #12')
+    expect(textOfRow(gitRowOf(90))).toBe('my-claude/fix-bar · feature/statusbar-git-row-with-pull-request-link · !2+1⇡3 · PR #12')
     for (const columns of [70, 60, 50]) {
       const row = textOfRow(gitRowOf(columns))
       expect(displayWidth(row)).toBe(columns)
-      expect(row).toStartWith('my-claude/fix-bar feature/')
-      expect(row).toEndWith('… !2+1⇡3 PR #12')
+      expect(row).toStartWith('my-claude/fix-bar · feature/')
+      expect(row).toEndWith('… · !2+1⇡3 · PR #12')
     }
     // 깨끗하고 upstream과 같으면 경로와 브랜치만, HEAD가 떨어지면 (커밋).
     expect(textOfRow(gitRowOf(200, { project: 'my-claude', branch: 'main', upstream: { ahead: 0, behind: 0 }, changes: NONE }))).toBe(
-      'my-claude main',
+      'my-claude · main',
     )
     const detached = gitRowOf(200, { project: 'my-claude', commit: '1234567', changes: NONE })
-    expect(textOfRow(detached)).toBe('my-claude (1234567)')
+    expect(textOfRow(detached)).toBe('my-claude · (1234567)')
     expect(detached.at(-1)?.style).toEqual({ color: 'green', bold: true })
   })
 
