@@ -35,9 +35,6 @@ export type StatusbarGit = {
   changes: StatusbarGitChanges
 }
 
-// 지금 도는 에이전트 하나. startedAt은 상태 줄이 처음 본 시각이다.
-export type StatusbarAgent = { id: string; label: string; description: string; startedAt: number }
-
 // TodoWrite의 항목에는 id가 없고, TaskCreate가 만든 작업에는 있다.
 export type StatusbarTodo = {
   id?: string
@@ -56,7 +53,6 @@ export type StatusbarSnapshot = {
   fable?: StatusbarFable
   fableFetchedAt?: number
   git?: StatusbarGit
-  agents?: StatusbarAgent[]
   todos?: StatusbarTodo[]
   now: number
 }

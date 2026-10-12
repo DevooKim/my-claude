@@ -1,7 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type {
-  AgentInfo,
   On,
   RenderElement,
   RenderSurface,
@@ -14,14 +13,12 @@ import type {
 
 import type { StatusbarGit, StatusbarSnapshot } from '../types'
 import {
-  agentLabel,
   applyTodoTool,
   displayWidth,
   effortFrom,
   effortSpans,
   fableOf,
   fitText,
-  formatElapsed,
   formatTokens,
   gitStatusOf,
   gitStatusText,
@@ -110,7 +107,6 @@ type World = {
   env: Record<string, string>
   repo?: Repo
   isFsRefused: boolean
-  agents: AgentInfo[]
   messages: SessionMessage[]
   bash: Record<string, unknown>
 }
@@ -124,7 +120,6 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
     settings: {},
     env: {},
     isFsRefused: false,
-    agents: [],
     messages: [],
     bash: { stdout: '', stderr: '', interrupted: false },
     ...initial,
@@ -197,8 +192,6 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
       ? { deny: 'outside the workspace' }
       : { value: (world.repo?.markers ?? []).some(marker => e.path.endsWith(`/${marker}`)) },
   )
-  on('agent.list', () => ({ value: world.agents }))
-  on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: world.agents.at(-1)?.id ?? 'agent-0' }))
   on('session.messages', () => ({ value: world.messages }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   // 도구는 엔진이 답하듯 기록을 돌려준다. TaskCreate는 1부터 id를 매긴다.
@@ -621,7 +614,7 @@ describe('git row', () => {
   })
 })
 
-describe('agents and todos row', () => {
+describe('todos row', () => {
   const TODOS = [
     { content: 'Parse git status', status: 'completed', activeForm: 'Parsing git status' },
     { content: 'Draw the git row', status: 'in_progress', activeForm: 'Drawing the git row' },
@@ -696,34 +689,6 @@ describe('agents and todos row', () => {
     expect((await bar($)).at(-1)).toBe('T ●●○ 1/3  Drawing the git row')
   })
 
-  test('a running agent shows with its elapsed time beside the todos and leaves when done', async ($, on) => {
-    const { clock, world } = setUp(on, { model: 'claude-opus-5-5', isReducedMotion: true })
-    const explorer: AgentInfo = { id: 'agent-1', description: 'Find the auth code', type: 'Explore', status: 'running' }
-
-    await $.session.start(START)
-    await $.tool.call({ tool: 'TodoWrite', todos: [...TODOS] })
-    await clock.settle()
-    world.agents = [explorer]
-    await $.agent.spawn({
-      tool_use_id: 'toolu_2',
-      prompt: 'Find where auth happens',
-      description: explorer.description,
-      subagentType: 'Explore',
-      provider: { plugin: 'engine', tier: 'core' },
-      parentModel: 'claude-opus-5-5',
-      background: true,
-      fork: false,
-    })
-    await clock.settle()
-    expect((await bar($)).at(-1)).toBe('● Explore · Find the auth code 0s  │  T ●●○ 1/3  Drawing the git row')
-
-    await clock.advance(72_000)
-    expect((await bar($)).at(-1)).toBe('● Explore · Find the auth code 1m12s  │  T ●●○ 1/3  Drawing the git row')
-
-    world.agents = [{ ...explorer, status: 'completed' }]
-    await clock.advance(1000)
-    expect((await bar($)).at(-1)).toBe('T ●●○ 1/3  Drawing the git row')
-  })
 })
 
 const SNAPSHOT: StatusbarSnapshot = {
@@ -878,30 +843,20 @@ describe('layout', () => {
     expect(gitStatusText({ changes: NONE })).toBe('')
   })
 
-  test('the agents and todos row drops descriptions, then counts what runs', () => {
+  test('the todos row shortens what runs now, then keeps only the count', () => {
     const snapshot: StatusbarSnapshot = {
       ...SNAPSHOT,
-      agents: [
-        { id: 'a', label: 'Explore', description: 'Find where the auth tokens are refreshed', startedAt: NOW - 72_000 },
-        { id: 'b', label: 'general-purpose', description: 'Fix the failing parser tests', startedAt: NOW - 5000 },
-      ],
       todos: [
         { id: '1', subject: 'Read git', status: 'completed' },
         { id: '2', subject: 'Draw', activeForm: '상태 줄에 git 줄을 그리는 중', status: 'in_progress' },
         { id: '3', subject: 'Test', status: 'pending' },
       ],
     }
-    const activity = (columns: number) => textOfRow(layoutRows(snapshot, columns).at(-1) ?? [])
+    const todoRow = (columns: number) => textOfRow(layoutRows(snapshot, columns).at(-1) ?? [])
 
-    expect(activity(200)).toBe(
-      '● Explore · Find where the auth tokens are refreshed 1m12s   ● general-purpose · Fix the failing parser tests 5s  │  T ●●○ 1/3  상태 줄에 git 줄을 그리는 중',
-    )
-    expect(activity(100)).toBe('● Explore 1m12s   ● general-purpose 5s  │  T ●●○ 1/3  상태 줄에 git 줄을 그리…')
-    expect(activity(50)).toBe('● 2 agents  │  T ●●○ 1/3  상태 줄에 git 줄을 그리…')
-    expect(activity(24)).toBe('● 2 agents  │  T ●●○ 1/3')
-    // 점은 1초마다 커졌다 작아진다(움직임을 줄이면 멈춘다).
-    const glyph = (frame?: number) => layoutRows(snapshot, 200, frame).at(-1)?.[0]?.text
-    expect([glyph(0), glyph(10), glyph(25), glyph(undefined)]).toEqual(['● ', '• ', '· ', '● '])
+    expect(todoRow(200)).toBe('T ●●○ 1/3  상태 줄에 git 줄을 그리는 중')
+    expect(todoRow(30)).toBe('T ●●○ 1/3  상태 줄에 g…')
+    expect(todoRow(10)).toBe('T ●●○ 1/3')
   })
 
   test('todo dots: one per todo in done, running and left colors; past ten they share ten dots', () => {
@@ -1013,11 +968,7 @@ describe('formatting', () => {
     expect(applyTodoTool(listed, 'TaskUpdate', { taskId: '1', status: 'completed' }, { success: false })).toEqual(listed)
   })
 
-  test('agent labels, elapsed time and fitted text', () => {
-    expect(agentLabel({ type: 'humanize-korean:humanize-monolith' })).toBe('humanize-monolith')
-    expect(agentLabel({ type: 'teammate', name: 'scout', teammateId: 'scout@team' })).toBe('scout')
-    expect(agentLabel({ type: 'Explore', name: 'agent-a1b2' })).toBe('Explore')
-    expect([0, 59_999, 72_000, 3_780_000].map(formatElapsed)).toEqual(['0s', '59s', '1m12s', '1h3m'])
+  test('fitted text', () => {
     expect(fitText('feature/long-name', 8)).toBe('feature…')
     expect(fitText('테스트 실행 중', 7)).toBe('테스트…')
     expect(fitText('short', 8)).toBe('short')

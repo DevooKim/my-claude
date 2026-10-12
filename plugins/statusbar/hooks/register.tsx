@@ -1,6 +1,5 @@
 import { atom, read, update } from 'claude-code'
 import type {
-  AgentInfo,
   ApiContentBlock,
   EngineInterface,
   HttpResponse,
@@ -15,7 +14,6 @@ import type {
 } from 'claude-code'
 
 import type {
-  StatusbarAgent,
   StatusbarEffort,
   StatusbarFable,
   StatusbarGit,
@@ -40,9 +38,6 @@ const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max']
 // git은 파일을 바꾸는 도구가 끝날 때마다, 그리고 바깥(다른 터미널)에서 바꾼 것도 잡도록 주기적으로 읽는다.
 const GIT_TICK_MS = 15_000
 const GIT_TIMEOUT_MS = 10_000
-// 에이전트가 도는 동안만 1초마다 목록을 다시 읽고 경과 시간을 다시 그린다.
-const AGENT_TICK_MS = 1000
-const ACTIVE_AGENT_STATUSES: ReadonlySet<string> = new Set(['pending', 'running', 'waiting'])
 // 끝나면 git 상태를 다시 읽는 도구와 할 일 목록을 바꾸는 도구.
 const WATCHED_TOOLS = [
   'Bash',
@@ -125,8 +120,7 @@ const BRANCH_COLOR = 'gray'
 const COMMIT_COLOR = 'green'
 const GIT_STATUS_COLOR = 'yellow'
 const MIN_BRANCH_COLUMNS = 12
-// 활동 줄: 에이전트마다 1초에 한 번 숨 쉬는 점, 할 일은 하나에 점 하나(끝냄·진행 중·남음).
-const BREATH = ['●', '•', '·', '•']
+// 할 일 줄: 할 일 하나에 점 하나(끝냄·진행 중·남음).
 const MAX_TODO_DOTS = 10
 
 const snapshotAtom = atom({ plugin: 'statusbar', key: 'snapshot' } as const, null, {
@@ -159,8 +153,6 @@ type State = {
   gitTicker: Timer | undefined
   gitQueue: Promise<void>
   isGitQueued: boolean
-  agents: StatusbarAgent[]
-  agentTicker: Timer | undefined
   todos: StatusbarTodo[]
 }
 
@@ -172,7 +164,6 @@ export type Span = { text: string; style?: SpanStyle }
 
 type Variant = { rows: 'one' | 'two' | 'stack'; bar: number; extras: boolean }
 type ResetStyle = 'minutes' | 'hours'
-type ActivityVariant = { agents: 'full' | 'short' | 'count'; todo: 'full' | 'count'; text: number }
 
 // 넓은 것부터 시도해 줄 너비에 맞는 첫 배치를 쓴다: 한 줄 → 두 줄 → 항목별 줄.
 const VARIANTS: readonly Variant[] = [
@@ -187,16 +178,8 @@ const VARIANTS: readonly Variant[] = [
   { rows: 'stack', bar: 5, extras: false },
 ]
 
-// 활동 줄도 넓은 것부터: 에이전트 설명 → 종류와 시간만 → 개수만, 할 일은 진행 중 항목 → 개수만.
-// text는 설명과 할 일 글자에 주는 최대 칸 수다.
-const ACTIVITY_VARIANTS: readonly ActivityVariant[] = [
-  { agents: 'full', todo: 'full', text: 40 },
-  { agents: 'full', todo: 'full', text: 24 },
-  { agents: 'short', todo: 'full', text: 24 },
-  { agents: 'count', todo: 'full', text: 24 },
-  { agents: 'count', todo: 'full', text: 12 },
-  { agents: 'count', todo: 'count', text: 0 },
-]
+// 할 일 줄도 넓은 것부터: 진행 중 항목을 40칸 → 24칸 → 12칸까지 줄이다가 개수만 남긴다.
+const TODO_TEXT_COLUMNS = [40, 24, 12, 0]
 
 export const register: Register = on => {
   const state: State = {
@@ -222,8 +205,6 @@ export const register: Register = on => {
     gitTicker: undefined,
     gitQueue: Promise.resolve(),
     isGitQueued: false,
-    agents: [],
-    agentTicker: undefined,
     todos: [],
   }
 
@@ -253,14 +234,6 @@ export const register: Register = on => {
   on('tool.call', { tool: WATCHED_TOOLS }, async ($, e, next) => {
     const result = await next(e)
     if (state.isLive) noteTool($, state, e, result)
-
-    return result
-  }).catch(($, e, next) => next(e))
-
-  // 에이전트가 뜨면 곧바로 목록을 읽어 활동 줄에 올린다. 끝나는 것은 1초 주기가 잡는다.
-  on('agent.spawn', async ($, e, next) => {
-    const result = await next(e)
-    if (state.isLive) $.clock.after(0, () => void refreshAgents($, state))
 
     return result
   }).catch(($, e, next) => next(e))
@@ -335,7 +308,7 @@ export const register: Register = on => {
       <Box flexDirection="column">
         {own}
         <Box flexDirection="column" marginTop={ROW_GAP}>
-          {layoutRows(snapshot, columns, frame, now).map(row => (
+          {layoutRows(snapshot, columns, frame).map(row => (
             <Text wrap="truncate-end">
               {row.map(part =>
                 part.style === undefined ? part.text : <Text {...part.style}>{part.text}</Text>,
@@ -356,30 +329,21 @@ async function restore($: EngineInterface, state: State): Promise<void> {
   if (previous.fable !== undefined) state.fable = previous.fable
   if (previous.fableFetchedAt !== undefined) state.lastFetchedAt = previous.fableFetchedAt
   if (previous.git !== undefined) state.git = previous.git
-  if (previous.agents !== undefined) state.agents = previous.agents
   if (previous.todos !== undefined) state.todos = previous.todos
 }
 
 // 타이머를 새로 걸고 스냅숏을 다시 쓴다. 몇 번 불러도 같은 모습이 된다.
 function startLive($: EngineInterface, state: State): void {
   state.ticker?.cancel()
-  state.ticker = $.clock.every(TICK_MS, () => {
-    void refresh($, state)
-    void refreshAgents($, state)
-  })
+  state.ticker = $.clock.every(TICK_MS, () => void refresh($, state))
   state.gitTicker?.cancel()
   state.gitTicker = $.clock.every(GIT_TICK_MS, () => void refreshGit($, state))
   state.animator?.cancel()
   state.animator = undefined
   syncAnimation($, state)
-  state.agentTicker?.cancel()
-  state.agentTicker = undefined
   state.published = undefined
   schedule($, state)
-  $.clock.after(0, () => {
-    void refreshGit($, state)
-    void refreshAgents($, state)
-  })
+  $.clock.after(0, () => void refreshGit($, state))
 }
 
 // 첫 요청 전에는 보낼 effort를 알 길이 없으므로 엔진이 읽는 설정에서 미리 짐작한다:
@@ -530,7 +494,6 @@ function snapshotOf(
     ...(state.hasPlan ? { fable: state.fable } : {}),
     ...(Number.isFinite(state.lastFetchedAt) ? { fableFetchedAt: state.lastFetchedAt } : {}),
     ...(git ? { git } : {}),
-    ...(state.agents.length > 0 ? { agents: state.agents } : {}),
     ...(state.todos.length > 0 ? { todos: state.todos } : {}),
   }
 }
@@ -698,49 +661,6 @@ export function gitStatusOf(text: string): Omit<StatusbarGit, 'project' | 'workt
   }
 }
 
-// 도는(대기 포함) 에이전트만 남긴다. 처음 본 시각을 지켜 경과 시간이 이어지게 한다.
-async function refreshAgents($: EngineInterface, state: State): Promise<void> {
-  if (!state.isLive) return
-  try {
-    const [listed, now] = await Promise.all([$.agent.list(), $.clock.now()])
-    const agents = listed
-      .filter(agent => ACTIVE_AGENT_STATUSES.has(agent.status))
-      .map(agent => ({
-        id: agent.id,
-        label: agentLabel(agent),
-        description: agent.description,
-        startedAt: state.agents.find(one => one.id === agent.id)?.startedAt ?? now,
-      }))
-    const isChanged = JSON.stringify(agents) !== JSON.stringify(state.agents)
-    state.agents = agents
-    syncAgentTicker($, state)
-    if (isChanged) schedule($, state)
-  } catch (error) {
-    $.ui.log(`statusbar: agents not listed: ${describe(error)}`, { to: 'debug' })
-  }
-}
-
-function syncAgentTicker($: EngineInterface, state: State): void {
-  const shouldRun = state.isLive && state.agents.length > 0
-  if (shouldRun && state.agentTicker === undefined) {
-    state.agentTicker = $.clock.every(AGENT_TICK_MS, () => {
-      $.ui.invalidate('ui.render')
-      void refreshAgents($, state)
-    })
-  }
-  if (!shouldRun && state.agentTicker !== undefined) {
-    state.agentTicker.cancel()
-    state.agentTicker = undefined
-  }
-}
-
-// 팀원은 팀 안의 이름으로, 그 밖은 종류(플러그인 접두어를 뗀)로 부른다.
-export function agentLabel(agent: Pick<AgentInfo, 'type' | 'name' | 'teammateId'>): string {
-  if (agent.teammateId !== undefined && agent.name !== undefined) return agent.name
-
-  return agent.type.replace(/^[^:]+:/, '')
-}
-
 function noteTool($: EngineInterface, state: State, e: ToolCallInput, result: ToolCallResult): void {
   try {
     if (result.deny !== undefined || result.isError === true) return
@@ -861,15 +781,10 @@ async function replayedTodos($: EngineInterface): Promise<StatusbarTodo[]> {
   }
 }
 
-// 사용량 줄(좁으면 여러 줄) 아래에 git 줄, 그 아래에 에이전트·할 일 줄을 둔다. 뒤의 두 줄은
+// 사용량 줄(좁으면 여러 줄) 아래에 git 줄, 그 아래에 할 일 줄을 둔다. 뒤의 두 줄은
 // 보일 것이 있을 때만 그린다.
-export function layoutRows(
-  snapshot: StatusbarSnapshot,
-  columns: number,
-  frame?: Frame,
-  now: number = snapshot.now,
-): Span[][] {
-  return [...usageRows(snapshot, columns, frame), ...gitRows(snapshot.git, columns), ...activityRows(snapshot, columns, now, frame)]
+export function layoutRows(snapshot: StatusbarSnapshot, columns: number, frame?: Frame): Span[][] {
+  return [...usageRows(snapshot, columns, frame), ...gitRows(snapshot.git, columns), ...todoRows(snapshot, columns)]
 }
 
 function usageRows(snapshot: StatusbarSnapshot, columns: number, frame: Frame): Span[][] {
@@ -939,53 +854,27 @@ export function gitStatusText(git: Pick<StatusbarGit, 'changes' | 'upstream'>): 
   ].join('')
 }
 
-function activityRows(snapshot: StatusbarSnapshot, columns: number, now: number, frame: Frame): Span[][] {
-  const agents = snapshot.agents ?? []
+// 할 일 줄: 다 끝냈거나 비었으면 그리지 않는다. 넘치면 진행 중 항목 글자를 줄인다.
+function todoRows(snapshot: StatusbarSnapshot, columns: number): Span[][] {
   const todos = todoProgress(snapshot.todos)
-  if (agents.length === 0 && todos === undefined) return []
-  const separator = [span('  '), span('│', { color: FAINT }), span('  ')]
+  if (todos === undefined) return []
   let row: Span[] = []
-  for (const variant of ACTIVITY_VARIANTS) {
-    const groups = [agentSpans(agents, variant, now, frame), todoSpans(todos, variant)]
-    row = joinSpans(
-      groups.filter(group => group.length > 0),
-      separator,
-    )
+  for (const textColumns of TODO_TEXT_COLUMNS) {
+    row = todoSpans(todos, textColumns)
     if (widthOf(row) <= columns) return [row]
   }
 
   return [row]
 }
 
-// 에이전트 하나: ● 종류 · 하는 일 경과. 점은 1초마다 커졌다 작아진다(움직임을 줄이면 멈춘다).
-function agentSpans(agents: readonly StatusbarAgent[], variant: ActivityVariant, now: number, frame: Frame): Span[] {
-  if (agents.length === 0) return []
-  const breath = BREATH[frame === undefined ? 0 : Math.floor((frame * FRAME_MS) / 1000) % BREATH.length]
-  const dot = span(`${breath} `, { color: BRAND })
-  if (variant.agents === 'count' && agents.length > 1) return [dot, span(`${agents.length} agents`, { bold: true })]
-  const one = (agent: StatusbarAgent): Span[] => [
-    dot,
-    span(agent.label, { bold: true }),
-    ...(variant.agents === 'full' && agent.description !== ''
-      ? [span(' · ', { color: FAINT }), span(fitText(agent.description, variant.text))]
-      : []),
-    span(` ${formatElapsed(now - agent.startedAt)}`, { color: MUTED }),
-  ]
-
-  return joinSpans(agents.map(one), [span('   ')])
-}
-
 // 사용량 줄의 미터처럼 라벨 T를 붙이고, 할 일 하나를 점 하나로 그린다: 끝냄 초록, 진행 중 주황, 남음 빈 점.
-function todoSpans(todos: TodoProgress | undefined, variant: ActivityVariant): Span[] {
-  if (todos === undefined) return []
+function todoSpans(todos: TodoProgress, textColumns: number): Span[] {
 
   return [
     span('T ', { color: LABEL_COLORS.T ?? MUTED }),
     ...todoDots(todos),
     span(` ${todos.done}/${todos.total}`, { bold: true }),
-    ...(variant.todo === 'full' && todos.current !== undefined
-      ? [span(`  ${fitText(todos.current, variant.text)}`)]
-      : []),
+    ...(textColumns > 0 && todos.current !== undefined ? [span(`  ${fitText(todos.current, textColumns)}`)] : []),
   ]
 }
 
@@ -1019,16 +908,6 @@ export function todoProgress(todos: readonly StatusbarTodo[] | undefined): TodoP
     total: todos.length,
     ...(current ? { current: current.activeForm ?? current.subject } : {}),
   }
-}
-
-// 12s, 1m12s, 1h3m.
-export function formatElapsed(ms: number): string {
-  const seconds = Math.max(0, Math.floor(ms / 1000))
-  if (seconds < 60) return `${seconds}s`
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes}m${seconds % 60}s`
-
-  return `${Math.floor(minutes / 60)}h${minutes % 60}m`
 }
 
 // 너비(칸)에 맞게 자르고 끝에 …을 붙인다. 한글은 두 칸으로 센다.
