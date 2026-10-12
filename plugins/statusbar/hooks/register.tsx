@@ -854,9 +854,9 @@ function noteTool($: EngineInterface, state: State, e: ToolCallInput, result: To
   if (touchesPr || isWrite) $.clock.after(0, () => void refreshGit($, state))
 }
 
-// 사용량 줄(좁으면 여러 줄) 아래에 git 줄을 둔다. git 줄은 저장소 안에서만 그린다.
+// git 줄(저장소 안에서만) 아래에 사용량 줄(좁으면 여러 줄)을 둔다.
 export function layoutRows(snapshot: StatusbarSnapshot, columns: number, frame?: Frame): Span[][] {
-  return [...usageRows(snapshot, columns, frame), ...gitRows(snapshot.git, columns)]
+  return [...gitRows(snapshot.git, columns), ...usageRows(snapshot, columns, frame)]
 }
 
 function usageRows(snapshot: StatusbarSnapshot, columns: number, frame: Frame): Span[][] {

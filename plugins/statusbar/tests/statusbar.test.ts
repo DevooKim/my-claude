@@ -552,7 +552,7 @@ describe('git row', () => {
     await $.session.start(START)
     await clock.settle()
     for (const surface of ['terminal', 'desktop'] as const) {
-      expect(await bar($, { surface })).toEqual([OPUS_ROW, 'my-claude · feature/bar · !2+2?3⇡2⇣1'])
+      expect(await bar($, { surface })).toEqual(['my-claude · feature/bar · !2+2?3⇡2⇣1', OPUS_ROW])
     }
     // git은 선택적 잠금 없이 읽어 모델의 git 명령과 index.lock을 다투지 않는다.
     expect(runs.filter(argv => argv[0] === 'git').every(argv => argv[1] === '--no-optional-locks')).toBe(true)
@@ -573,7 +573,7 @@ describe('git row', () => {
 
     await $.session.start(START)
     await clock.settle()
-    expect((await bar($))[1]).toBe('my-claude/fix-bar · worktree-fix-bar')
+    expect((await bar($))[0]).toBe('my-claude/fix-bar · worktree-fix-bar')
   })
 
   test('a linked worktree, a rebase on a detached HEAD and a conflict', async ($, on) => {
@@ -594,7 +594,7 @@ describe('git row', () => {
 
     await $.session.start(START)
     await clock.settle()
-    expect(await bar($)).toEqual([OPUS_ROW, 'my-claude/fix-bar · (1234567) (REBASING) · =1'])
+    expect(await bar($)).toEqual(['my-claude/fix-bar · (1234567) (REBASING) · =1', OPUS_ROW])
   })
 
   test('a push that sets the upstream shows at once', async ($, on) => {
@@ -603,12 +603,12 @@ describe('git row', () => {
 
     await $.session.start(START)
     await clock.settle()
-    expect(await bar($)).toEqual([OPUS_ROW, 'my-claude · topic'])
+    expect(await bar($)).toEqual(['my-claude · topic', OPUS_ROW])
 
     repo.status = porcelain(`# branch.oid ${OID}`, '# branch.head topic', '# branch.upstream origin/topic', '# branch.ab +0 -1')
     await $.tool.call({ tool: 'Bash', command: 'git push -u origin topic', description: 'Push the branch' })
     await clock.settle()
-    expect(await bar($)).toEqual([OPUS_ROW, 'my-claude · topic · ⇣1'])
+    expect(await bar($)).toEqual(['my-claude · topic · ⇣1', OPUS_ROW])
   })
 
   test('the PR state of the branch: conflicts, CI and review, from the origin owner\'s PR', async ($, on) => {
@@ -628,7 +628,7 @@ describe('git row', () => {
 
     await $.session.start(START)
     await clock.settle()
-    expect((await bar($))[1]).toBe('my-claude · feature/bar · !2+2?3⇡2⇣1 · PR #1')
+    expect((await bar($))[0]).toBe('my-claude · feature/bar · !2+2?3⇡2⇣1 · PR #1')
     expect(runs.filter(argv => argv[0] === 'gh')).toEqual([['gh', 'pr', 'list', '--head', 'feature/bar', ...GH_ARGS]])
     // PR 번호는 누르면 기본 브라우저로 PR 페이지를 여는 버튼이다.
     const ui = await $.ui.mount({
@@ -654,13 +654,13 @@ describe('git row', () => {
 
     await $.session.start(START)
     await clock.settle()
-    expect((await bar($))[1]).toBe('my-claude · topic · PR #1')
+    expect((await bar($))[0]).toBe('my-claude · topic · PR #1')
 
     // GitHub가 머지 가능 여부를 아직 몰라(UNKNOWN) 20초가 지난 다음 git 확인(30초 주기) 때 다시 묻는다.
     world.prs = [prRow({ statusCheckRollup: [CHECK('', 'IN_PROGRESS')], reviewDecision: 'APPROVED' })]
     await clock.advance(30_000)
     expect(asked()).toBe(2)
-    expect((await bar($))[1]).toBe('my-claude · topic · PR #1')
+    expect((await bar($))[0]).toBe('my-claude · topic · PR #1')
 
     await clock.advance(2 * MINUTE)
     expect(asked()).toBe(2)
@@ -673,7 +673,7 @@ describe('git row', () => {
     await $.tool.call({ tool: 'Bash', command: 'gh pr merge --squash', description: 'Merge the PR' })
     await clock.settle()
     expect(asked()).toBe(4)
-    expect((await bar($))[1]).toBe('my-claude · topic · PR #1')
+    expect((await bar($))[0]).toBe('my-claude · topic · PR #1')
   })
 
   test('a push or pull from another terminal asks for the PR state on the next poll', async ($, on) => {
@@ -700,11 +700,11 @@ describe('git row', () => {
 
     await $.session.start(START)
     await clock.settle()
-    expect((await bar($))[1]).toBe('my-claude · main')
+    expect((await bar($))[0]).toBe('my-claude · main')
 
     repo.status = porcelain(`# branch.oid ${OID}`, '# branch.head main', '? new-file.ts')
     await clock.advance(30_000)
-    expect((await bar($))[1]).toBe('my-claude · main · ?1')
+    expect((await bar($))[0]).toBe('my-claude · main · ?1')
   })
 })
 
@@ -824,7 +824,7 @@ describe('layout', () => {
     upstream: { ahead: 3, behind: 0 },
     changes: { ...NONE, staged: 1, modified: 2 },
   }
-  const gitRowOf = (columns: number, git: StatusbarGit = GIT) => layoutRows({ ...SNAPSHOT, git }, columns).at(-1) ?? []
+  const gitRowOf = (columns: number, git: StatusbarGit = GIT) => layoutRows({ ...SNAPSHOT, git }, columns).at(0) ?? []
 
   test('the git row reads like the starship prompt and shortens the branch when narrow', () => {
     const wide = gitRowOf(200)
