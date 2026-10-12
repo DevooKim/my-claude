@@ -656,7 +656,7 @@ describe('git row', () => {
     await clock.settle()
     expect((await bar($))[1]).toBe('my-claude · topic · PR #1')
 
-    // GitHub가 머지 가능 여부를 아직 몰라(UNKNOWN) 20초가 지난 다음 git 확인(15초 주기) 때 다시 묻는다.
+    // GitHub가 머지 가능 여부를 아직 몰라(UNKNOWN) 20초가 지난 다음 git 확인(30초 주기) 때 다시 묻는다.
     world.prs = [prRow({ statusCheckRollup: [CHECK('', 'IN_PROGRESS')], reviewDecision: 'APPROVED' })]
     await clock.advance(30_000)
     expect(asked()).toBe(2)
@@ -686,11 +686,11 @@ describe('git row', () => {
     await $.session.start(START)
     await clock.settle()
     expect(asked()).toBe(1)
-    await clock.advance(15_000)
+    await clock.advance(30_000)
     expect(asked()).toBe(1)
 
     repo.status = ahead(0)
-    await clock.advance(15_000)
+    await clock.advance(30_000)
     expect(asked()).toBe(2)
   })
 
@@ -703,7 +703,7 @@ describe('git row', () => {
     expect((await bar($))[1]).toBe('my-claude · main')
 
     repo.status = porcelain(`# branch.oid ${OID}`, '# branch.head main', '? new-file.ts')
-    await clock.advance(15_000)
+    await clock.advance(30_000)
     expect((await bar($))[1]).toBe('my-claude · main · ?1')
   })
 })

@@ -36,10 +36,10 @@ const BACKOFF_MS = 5 * 60_000
 const BACKOFF_CAP_MS = 60 * 60_000
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max']
 // git은 파일을 바꾸는 도구가 끝날 때마다, 그리고 바깥(다른 터미널)에서 바꾼 것도 잡도록 주기적으로 읽는다.
-const GIT_TICK_MS = 15_000
+const GIT_TICK_MS = 30_000
 const GIT_TIMEOUT_MS = 10_000
 // PR 상태는 브랜치가 바뀌거나 푸시·PR 명령이 돌면 곧바로, 아니면 3분마다 gh로 다시 묻는다. GitHub가
-// 머지 가능 여부를 아직 계산하지 못했으면(UNKNOWN) 20초가 지난 다음 git 확인 때 다시 묻는다.
+// 머지 가능 여부를 아직 계산하지 못했으면(UNKNOWN) 다음 git 확인(30초 주기) 때 다시 묻는다.
 const PR_REFRESH_MS = 3 * 60_000
 const PR_UNKNOWN_RETRY_MS = 20_000
 const PR_TIMEOUT_MS = 15_000
