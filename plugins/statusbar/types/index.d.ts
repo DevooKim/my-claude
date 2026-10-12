@@ -10,8 +10,10 @@ export type StatusbarFable =
   | { kind: 'absent' }
   | { kind: 'reading'; window: StatusbarWindow }
 
-// 지금 브랜치 PR의 상태. 번호는 Claude Code가 힌트 줄에 보여 주므로 담지 않는다.
+// 지금 브랜치 PR의 번호·주소와 상태.
 export type StatusbarPullRequest = {
+  number: number
+  url: string
   state: 'open' | 'draft' | 'merged' | 'closed'
   merge?: 'clean' | 'conflict' | 'behind'
   checks?: 'pass' | 'fail' | 'pending'

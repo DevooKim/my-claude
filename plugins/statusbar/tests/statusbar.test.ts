@@ -49,7 +49,10 @@ const REMOTE = 'https://github.com/DevooKim/my-claude.git'
 const OID = '1234567890abcdef1234567890abcdef12345678'
 const porcelain = (...lines: string[]) => `${lines.join('\n')}\n`
 // gh pr list의 한 줄. 소유자가 다르면 같은 이름의 브랜치로 남의 포크에서 연 PR이다.
+const PR_URL = 'https://github.com/DevooKim/my-claude/pull/1'
 const prRow = (fields: Record<string, unknown>, login = 'DevooKim') => ({
+  number: 1,
+  url: PR_URL,
   state: 'OPEN',
   isDraft: false,
   mergeable: 'MERGEABLE',
@@ -60,7 +63,7 @@ const prRow = (fields: Record<string, unknown>, login = 'DevooKim') => ({
   ...fields,
 })
 const CHECK = (conclusion: string, status = 'COMPLETED') => ({ __typename: 'CheckRun', name: 'ci', status, conclusion })
-const GH_ARGS = ['--state', 'all', '--limit', '10', '--json', 'state,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,headRepositoryOwner']
+const GH_ARGS = ['--state', 'all', '--limit', '10', '--json', 'number,url,state,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,headRepositoryOwner']
 // 스테이징 2(M., MM), 수정 2(.M, MM), 추적 안 함 3, upstream보다 2 앞서고 1 뒤처짐.
 const FEATURE_STATUS = porcelain(
   `# branch.oid ${OID}`,
@@ -193,6 +196,7 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
     const { repo } = world
     if (command === 'open') return ran(0, '')
     if (command === 'gh') return ran(0, JSON.stringify(world.prs))
+    if (command === 'open') return ran(0, '')
     if (command !== 'git' || repo === undefined) return ran(128, '', 'fatal: not a git repository')
     if (args.includes('status')) return ran(0, repo.status)
 
@@ -623,8 +627,19 @@ describe('git row', () => {
 
     await $.session.start(START)
     await clock.settle()
-    expect((await bar($))[1]).toBe('my-claude · feature/bar · !2+2?3⇡2⇣1 · 충돌  CI 실패  리뷰 필요')
+    expect((await bar($))[1]).toBe('my-claude · feature/bar · !2+2?3⇡2⇣1 · PR #1  충돌  CI 실패  리뷰 필요')
     expect(runs.filter(argv => argv[0] === 'gh')).toEqual([['gh', 'pr', 'list', '--head', 'feature/bar', ...GH_ARGS]])
+    // PR 번호는 누르면 기본 브라우저로 PR 페이지를 여는 버튼이다.
+    const ui = await $.ui.mount({
+      plugin: 'statusbar',
+      surface: 'terminal',
+      component: 'PromptHint',
+      props: { isDraft: false, isWorking: false, hint: ENGINE_LINE },
+      viewport: { columns: 164, rows: 40, isFullscreen: true },
+    })
+    await ui.press({ key: `open:${PR_URL}` })
+    await ui.unmount()
+    expect(runs.at(-1)).toEqual(['open', PR_URL])
   })
 
   test('PR state is asked again every 3 minutes, sooner while GitHub has not decided, and after PR commands', async ($, on) => {
@@ -638,13 +653,13 @@ describe('git row', () => {
 
     await $.session.start(START)
     await clock.settle()
-    expect((await bar($))[1]).toBe('my-claude · topic · draft')
+    expect((await bar($))[1]).toBe('my-claude · topic · PR #1  draft')
 
     // GitHub가 머지 가능 여부를 아직 몰라(UNKNOWN) 20초가 지난 다음 git 확인(15초 주기) 때 다시 묻는다.
     world.prs = [prRow({ statusCheckRollup: [CHECK('', 'IN_PROGRESS')], reviewDecision: 'APPROVED' })]
     await clock.advance(30_000)
     expect(asked()).toBe(2)
-    expect((await bar($))[1]).toBe('my-claude · topic · 머지 가능  CI 진행 중  승인됨')
+    expect((await bar($))[1]).toBe('my-claude · topic · PR #1  머지 가능  CI 진행 중  승인됨')
 
     await clock.advance(2 * MINUTE)
     expect(asked()).toBe(2)
@@ -657,7 +672,7 @@ describe('git row', () => {
     await $.tool.call({ tool: 'Bash', command: 'gh pr merge --squash', description: 'Merge the PR' })
     await clock.settle()
     expect(asked()).toBe(4)
-    expect((await bar($))[1]).toBe('my-claude · topic · merged')
+    expect((await bar($))[1]).toBe('my-claude · topic · PR #1  merged')
   })
 
   test('a change from another terminal shows on the next poll', async ($, on) => {
@@ -897,16 +912,18 @@ describe('formatting', () => {
   })
 
   test('the PR state of gh pr list', () => {
-    expect(pullRequestOf(prRow({}))).toEqual({ state: 'open', merge: 'clean' })
-    expect(pullRequestOf(prRow({ isDraft: true, mergeStateStatus: 'DRAFT' }))).toEqual({ state: 'draft' })
+    expect(pullRequestOf(prRow({}))).toEqual({ number: 1, url: PR_URL, state: 'open', merge: 'clean' })
+    expect(pullRequestOf(prRow({ isDraft: true, mergeStateStatus: 'DRAFT' }))).toEqual({ number: 1, url: PR_URL, state: 'draft' })
     expect(pullRequestOf(prRow({ mergeStateStatus: 'BEHIND', reviewDecision: 'CHANGES_REQUESTED' }))).toEqual({
+      number: 1,
+      url: PR_URL,
       state: 'open',
       merge: 'behind',
       review: 'changes',
     })
     // StatusContext는 state만 준다.
     expect(pullRequestOf(prRow({ statusCheckRollup: [{ __typename: 'StatusContext', state: 'SUCCESS' }, CHECK('SKIPPED')] }))?.checks).toBe('pass')
-    expect(pullRequestOf(prRow({ state: 'CLOSED', mergeable: 'CONFLICTING' }))).toEqual({ state: 'closed' })
+    expect(pullRequestOf(prRow({ state: 'CLOSED', mergeable: 'CONFLICTING' }))).toEqual({ number: 1, url: PR_URL, state: 'closed' })
   })
 
   test('the owner of the origin remote', () => {

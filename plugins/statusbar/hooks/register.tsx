@@ -45,7 +45,7 @@ const PR_UNKNOWN_RETRY_MS = 20_000
 const PR_TIMEOUT_MS = 15_000
 // --head는 브랜치 이름만 맞춰 남의 포크에서 온 같은 이름의 PR도 준다: 넉넉히 받아 소유자로 거른다.
 const PR_LIST_LIMIT = 10
-const PR_FIELDS = 'state,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,headRepositoryOwner'
+const PR_FIELDS = 'number,url,state,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,headRepositoryOwner'
 const PR_COMMAND = /\b(?:gh\s+pr|git\s+push)\b/
 // 끝나면 git 상태를 다시 읽는 도구.
 const WATCHED_TOOLS = [
@@ -183,8 +183,9 @@ type PullRequestTarget = { key: string; branch: string; owner: string }
 // 애니메이션의 현재 칸. 움직임을 줄인 설정이면 undefined로 멈춘 모습을 그린다.
 type Frame = number | undefined
 
-export type SpanStyle = { color?: string; dimColor?: boolean; bold?: boolean }
-export type Span = { text: string; style?: SpanStyle }
+export type SpanStyle = { color?: string; dimColor?: boolean; bold?: boolean; underline?: boolean }
+// href가 있으면 그 글자들을 누르면 그 주소가 열리는 버튼으로 그린다.
+export type Span = { text: string; style?: SpanStyle; href?: string }
 
 type Variant = { rows: 'one' | 'two' | 'stack'; bar: number; extras: boolean }
 type ResetStyle = 'minutes' | 'hours'
@@ -308,27 +309,69 @@ export const register: Register = on => {
 
       return own
     }
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
     const columns = Math.max(MIN_COLUMNS, (e.viewport?.columns ?? FALLBACK_COLUMNS) - FOOTER_INSET)
     const now = await $.clock.now()
     const frame = state.isReducedMotion ? undefined : Math.floor(now / FRAME_MS)
+    const draw = (part: Span) =>
+      part.style === undefined ? part.text : <Text {...part.style}>{part.text}</Text>
+    // href가 있는 조각은 누르면 그 주소를 브라우저로 여는 버튼이다. 링크(OSC 8)는 터미널에 따라
+    // 주소를 글자로 덧붙이므로 쓰지 않는다. 버튼은 Text 안에 못 들어가 그런 줄은 가로 Box로 그린다.
+    const drawRow = (row: Span[]) => {
+      const runs = linkRuns(row)
+      if (runs.every(run => run.href === undefined)) return <Text wrap="truncate-end">{row.map(draw)}</Text>
+
+      return (
+        <Box flexDirection="row">
+          {runs.map(run => {
+            const { href } = run
+            if (href === undefined) return <Text>{run.parts.map(draw)}</Text>
+
+            return (
+              <Button plain key={`open:${href}`} onPress={() => void openPage($, href)}>
+                {run.parts.map(draw)}
+              </Button>
+            )
+          })}
+        </Box>
+      )
+    }
 
     // 엔진의 힌트 줄 아래 ROW_GAP 줄을 띄우고 상태 줄을 그린다.
     return (
       <Box flexDirection="column">
         {own}
         <Box flexDirection="column" marginTop={ROW_GAP}>
-          {layoutRows(snapshot, columns, frame).map(row => (
-            <Text wrap="truncate-end">
-              {row.map(part =>
-                part.style === undefined ? part.text : <Text {...part.style}>{part.text}</Text>,
-              )}
-            </Text>
-          ))}
+          {layoutRows(snapshot, columns, frame).map(drawRow)}
         </Box>
       </Box>
     )
   })
+}
+
+// 주소를 기본 브라우저로 연다: macOS는 open, 그 밖은 xdg-open.
+async function openPage($: EngineInterface, url: string): Promise<void> {
+  for (const opener of ['open', 'xdg-open']) {
+    try {
+      const { exitCode } = await $.process.run([opener, url])
+      if (exitCode === 0) return
+    } catch {
+      // 다음 방법으로 넘어간다.
+    }
+  }
+  $.ui.log(`statusbar: could not open ${url}`, { to: 'debug' })
+}
+
+// 이어진 조각을 href별로 묶는다: 같은 href끼리, href 없는 것끼리.
+function linkRuns(row: readonly Span[]): { href?: string; parts: Span[] }[] {
+  const runs: { href?: string; parts: Span[] }[] = []
+  for (const part of row) {
+    const last = runs.at(-1)
+    if (last !== undefined && last.href === part.href) last.parts.push(part)
+    else runs.push(part.href === undefined ? { parts: [part] } : { href: part.href, parts: [part] })
+  }
+
+  return runs
 }
 
 async function restore($: EngineInterface, state: State): Promise<void> {
@@ -695,8 +738,9 @@ function ownRow(rows: unknown, owner: string): Json | undefined {
 export function pullRequestOf(row: Json): StatusbarPullRequest | undefined {
   const state =
     row.state === 'MERGED' ? 'merged' : row.state === 'CLOSED' ? 'closed' : row.state === 'OPEN' ? (row.isDraft === true ? 'draft' : 'open') : undefined
-  if (state === undefined) return undefined
-  if (state === 'merged' || state === 'closed') return { state }
+  if (state === undefined || typeof row.number !== 'number' || typeof row.url !== 'string') return undefined
+  const base: StatusbarPullRequest = { number: row.number, url: row.url, state }
+  if (state === 'merged' || state === 'closed') return base
   const merge =
     row.mergeable === 'CONFLICTING' || row.mergeStateStatus === 'DIRTY'
       ? 'conflict'
@@ -715,7 +759,7 @@ export function pullRequestOf(row: Json): StatusbarPullRequest | undefined {
           ? 'required'
           : undefined
 
-  return { state, ...(merge ? { merge } : {}), ...(checks ? { checks } : {}), ...(review ? { review } : {}) }
+  return { ...base, ...(merge ? { merge } : {}), ...(checks ? { checks } : {}), ...(review ? { review } : {}) }
 }
 
 // 검사 하나라도 실패면 실패, 아니면 하나라도 도는 중이면 진행 중, 모두 끝나 통과면 통과.
@@ -864,10 +908,13 @@ function gitSpans(git: StatusbarGit, hasPr: boolean, branchColumns = Number.POSI
   )
 }
 
-// PR 상태 말들을 두 칸씩 띄워 늘어놓는다.
+// PR 번호(누르면 PR 페이지가 열림) 뒤에 상태 말들을 두 칸씩 띄워 늘어놓는다.
 function pullRequestSpans(pr: StatusbarPullRequest): Span[] {
   return joinSpans(
-    PR_LABELS.filter(label => label.is(pr)).map(label => [span(label.text, { color: label.color })]),
+    [
+      [span('PR ', { color: MUTED }, pr.url), span(`#${pr.number}`, { bold: true, underline: true }, pr.url)],
+      ...PR_LABELS.filter(label => label.is(pr)).map(label => [span(label.text, { color: label.color })]),
+    ],
     [span('  ')],
   )
 }
@@ -1049,8 +1096,8 @@ function meter(
   ]
 }
 
-function span(text: string, style?: SpanStyle): Span {
-  return style === undefined ? { text } : { text, style }
+function span(text: string, style?: SpanStyle, href?: string): Span {
+  return { text, ...(style !== undefined ? { style } : {}), ...(href !== undefined ? { href } : {}) }
 }
 
 function joinSpans(groups: readonly Span[][], separator: readonly Span[]): Span[] {
