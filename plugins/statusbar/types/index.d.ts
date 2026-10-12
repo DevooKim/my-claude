@@ -10,6 +10,14 @@ export type StatusbarFable =
   | { kind: 'absent' }
   | { kind: 'reading'; window: StatusbarWindow }
 
+// 지금 브랜치 PR의 상태. 번호는 Claude Code가 힌트 줄에 보여 주므로 담지 않는다.
+export type StatusbarPullRequest = {
+  state: 'open' | 'draft' | 'merged' | 'closed'
+  merge?: 'clean' | 'conflict' | 'behind'
+  checks?: 'pass' | 'fail' | 'pending'
+  review?: 'approved' | 'changes' | 'required'
+}
+
 export type StatusbarGitOperation = 'rebasing' | 'merging' | 'cherry-picking' | 'reverting' | 'bisecting'
 
 // starship의 git_status가 세는 것과 같다: 스태시 수, 그리고 바뀐 파일을 종류별로.
@@ -33,6 +41,7 @@ export type StatusbarGit = {
   operation?: StatusbarGitOperation
   upstream?: { ahead: number; behind: number }
   changes: StatusbarGitChanges
+  pr?: StatusbarPullRequest
 }
 
 // 상태 줄이 그리는 한 시점의 값. fable이 없으면 요금제 한도가 없는 세션이다.

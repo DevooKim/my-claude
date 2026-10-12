@@ -22,6 +22,8 @@ import {
   gitStatusText,
   layoutRows,
   prettyModel,
+  pullRequestOf,
+  remoteOwner,
   resetIn,
   statusOf,
 } from '../hooks/register'
@@ -46,6 +48,19 @@ const ROOT = '/work/my-claude'
 const REMOTE = 'https://github.com/DevooKim/my-claude.git'
 const OID = '1234567890abcdef1234567890abcdef12345678'
 const porcelain = (...lines: string[]) => `${lines.join('\n')}\n`
+// gh pr list의 한 줄. 소유자가 다르면 같은 이름의 브랜치로 남의 포크에서 연 PR이다.
+const prRow = (fields: Record<string, unknown>, login = 'DevooKim') => ({
+  state: 'OPEN',
+  isDraft: false,
+  mergeable: 'MERGEABLE',
+  mergeStateStatus: 'CLEAN',
+  reviewDecision: '',
+  statusCheckRollup: [],
+  headRepositoryOwner: { id: `U_${login}`, login },
+  ...fields,
+})
+const CHECK = (conclusion: string, status = 'COMPLETED') => ({ __typename: 'CheckRun', name: 'ci', status, conclusion })
+const GH_ARGS = ['--state', 'all', '--limit', '10', '--json', 'state,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,headRepositoryOwner']
 // 스테이징 2(M., MM), 수정 2(.M, MM), 추적 안 함 3, upstream보다 2 앞서고 1 뒤처짐.
 const FEATURE_STATUS = porcelain(
   `# branch.oid ${OID}`,
@@ -105,6 +120,8 @@ type World = {
   repo?: Repo
   isFsRefused: boolean
   bash: Record<string, unknown>
+  prs: unknown[]
+  isBashFailing: boolean
 }
 
 function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
@@ -117,6 +134,8 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
     env: {},
     isFsRefused: false,
     bash: { stdout: '', stderr: '', interrupted: false },
+    prs: [],
+    isBashFailing: false,
     ...initial,
   }
   const fetches: { url: string; auth?: string; beta?: string }[] = []
@@ -173,6 +192,7 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
     const [command, ...args] = e.argv
     const { repo } = world
     if (command === 'open') return ran(0, '')
+    if (command === 'gh') return ran(0, JSON.stringify(world.prs))
     if (command !== 'git' || repo === undefined) return ran(128, '', 'fatal: not a git repository')
     if (args.includes('status')) return ran(0, repo.status)
 
@@ -188,7 +208,11 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
       : { value: (world.repo?.markers ?? []).some(marker => e.path.endsWith(`/${marker}`)) },
   )
   // 도구는 엔진이 답하듯 기록을 돌려준다.
-  on('tool.call', () => ({ result: world.bash }))
+  on('tool.call', () =>
+    world.isBashFailing
+      ? { isError: true as const, result: 'GraphQL: Something went wrong', text: 'GraphQL: Something went wrong' }
+      : { result: world.bash },
+  )
 
   return { world, fetches, clock, redraws, session, runs }
 }
@@ -582,6 +606,60 @@ describe('git row', () => {
     expect(await bar($)).toEqual([OPUS_ROW, 'my-claude · topic · ⇣1'])
   })
 
+  test('the PR state of the branch: conflicts, CI and review, from the origin owner\'s PR', async ($, on) => {
+    const { clock, runs } = setUp(on, {
+      model: 'claude-opus-5-5',
+      repo: { root: ROOT, remote: REMOTE, status: FEATURE_STATUS },
+      prs: [
+        prRow({ mergeStateStatus: 'CLEAN' }, 'stranger'),
+        prRow({
+          mergeable: 'CONFLICTING',
+          mergeStateStatus: 'DIRTY',
+          reviewDecision: 'REVIEW_REQUIRED',
+          statusCheckRollup: [CHECK('SUCCESS'), CHECK('FAILURE')],
+        }),
+      ],
+    })
+
+    await $.session.start(START)
+    await clock.settle()
+    expect((await bar($))[1]).toBe('my-claude · feature/bar · !2+2?3⇡2⇣1 · 충돌  CI 실패  리뷰 필요')
+    expect(runs.filter(argv => argv[0] === 'gh')).toEqual([['gh', 'pr', 'list', '--head', 'feature/bar', ...GH_ARGS]])
+  })
+
+  test('PR state is asked again every 3 minutes, sooner while GitHub has not decided, and after PR commands', async ($, on) => {
+    const repo: Repo = { root: ROOT, remote: REMOTE, status: porcelain(`# branch.oid ${OID}`, '# branch.head topic') }
+    const { clock, runs, world } = setUp(on, {
+      model: 'claude-opus-5-5',
+      repo,
+      prs: [prRow({ isDraft: true, mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' })],
+    })
+    const asked = () => runs.filter(argv => argv[0] === 'gh').length
+
+    await $.session.start(START)
+    await clock.settle()
+    expect((await bar($))[1]).toBe('my-claude · topic · draft')
+
+    // GitHub가 머지 가능 여부를 아직 몰라(UNKNOWN) 20초가 지난 다음 git 확인(15초 주기) 때 다시 묻는다.
+    world.prs = [prRow({ statusCheckRollup: [CHECK('', 'IN_PROGRESS')], reviewDecision: 'APPROVED' })]
+    await clock.advance(30_000)
+    expect(asked()).toBe(2)
+    expect((await bar($))[1]).toBe('my-claude · topic · 머지 가능  CI 진행 중  승인됨')
+
+    await clock.advance(2 * MINUTE)
+    expect(asked()).toBe(2)
+    await clock.advance(MINUTE)
+    expect(asked()).toBe(3)
+
+    // gh가 GitHub 오류로 실패해도 PR 명령 뒤에는 바로 다시 묻는다.
+    world.prs = [prRow({ state: 'MERGED' })]
+    world.isBashFailing = true
+    await $.tool.call({ tool: 'Bash', command: 'gh pr merge --squash', description: 'Merge the PR' })
+    await clock.settle()
+    expect(asked()).toBe(4)
+    expect((await bar($))[1]).toBe('my-claude · topic · merged')
+  })
+
   test('a change from another terminal shows on the next poll', async ($, on) => {
     const repo: Repo = { root: ROOT, remote: null, status: porcelain(`# branch.oid ${OID}`, '# branch.head main') }
     const { clock } = setUp(on, { model: 'claude-opus-5-5', repo })
@@ -816,6 +894,26 @@ describe('formatting', () => {
       commit: '1234567',
       changes: none,
     })
+  })
+
+  test('the PR state of gh pr list', () => {
+    expect(pullRequestOf(prRow({}))).toEqual({ state: 'open', merge: 'clean' })
+    expect(pullRequestOf(prRow({ isDraft: true, mergeStateStatus: 'DRAFT' }))).toEqual({ state: 'draft' })
+    expect(pullRequestOf(prRow({ mergeStateStatus: 'BEHIND', reviewDecision: 'CHANGES_REQUESTED' }))).toEqual({
+      state: 'open',
+      merge: 'behind',
+      review: 'changes',
+    })
+    // StatusContext는 state만 준다.
+    expect(pullRequestOf(prRow({ statusCheckRollup: [{ __typename: 'StatusContext', state: 'SUCCESS' }, CHECK('SKIPPED')] }))?.checks).toBe('pass')
+    expect(pullRequestOf(prRow({ state: 'CLOSED', mergeable: 'CONFLICTING' }))).toEqual({ state: 'closed' })
+  })
+
+  test('the owner of the origin remote', () => {
+    expect(remoteOwner(REMOTE)).toBe('DevooKim')
+    expect(remoteOwner('git@github.com:DevooKim/my-claude.git')).toBe('DevooKim')
+    expect(remoteOwner('ssh://git@github.com/DevooKim/my-claude')).toBe('DevooKim')
+    expect(remoteOwner(null)).toBeUndefined()
   })
 
   test('fitted text', () => {

@@ -8,6 +8,7 @@ import type {
   SessionRateLimit,
   SessionUsage,
   Timer,
+  ToolCallInput,
   ToolCallResult,
   TurnStepInput,
 } from 'claude-code'
@@ -17,6 +18,7 @@ import type {
   StatusbarFable,
   StatusbarGit,
   StatusbarGitOperation,
+  StatusbarPullRequest,
   StatusbarSnapshot,
   StatusbarWindow,
 } from '../types'
@@ -36,6 +38,15 @@ const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max']
 // git은 파일을 바꾸는 도구가 끝날 때마다, 그리고 바깥(다른 터미널)에서 바꾼 것도 잡도록 주기적으로 읽는다.
 const GIT_TICK_MS = 15_000
 const GIT_TIMEOUT_MS = 10_000
+// PR 상태는 브랜치가 바뀌거나 푸시·PR 명령이 돌면 곧바로, 아니면 3분마다 gh로 다시 묻는다. GitHub가
+// 머지 가능 여부를 아직 계산하지 못했으면(UNKNOWN) 20초가 지난 다음 git 확인 때 다시 묻는다.
+const PR_REFRESH_MS = 3 * 60_000
+const PR_UNKNOWN_RETRY_MS = 20_000
+const PR_TIMEOUT_MS = 15_000
+// --head는 브랜치 이름만 맞춰 남의 포크에서 온 같은 이름의 PR도 준다: 넉넉히 받아 소유자로 거른다.
+const PR_LIST_LIMIT = 10
+const PR_FIELDS = 'state,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,headRepositoryOwner'
+const PR_COMMAND = /\b(?:gh\s+pr|git\s+push)\b/
 // 끝나면 git 상태를 다시 읽는 도구.
 const WATCHED_TOOLS = [
   'Bash',
@@ -110,6 +121,21 @@ const BRANCH_COLOR = 'gray'
 const COMMIT_COLOR = 'green'
 const GIT_STATUS_COLOR = 'yellow'
 const MIN_BRANCH_COLUMNS = 12
+// PR 상태 말과 색: 막는 것은 빨강, 기다리는 것은 노랑, 된 것은 초록.
+const PR_LABELS: readonly { text: string; color: string; is: (pr: StatusbarPullRequest) => boolean }[] = [
+  { text: 'merged', color: 'merged', is: pr => pr.state === 'merged' },
+  { text: 'closed', color: 'error', is: pr => pr.state === 'closed' },
+  { text: 'draft', color: 'inactive', is: pr => pr.state === 'draft' },
+  { text: '충돌', color: '#d03b3b', is: pr => pr.merge === 'conflict' },
+  { text: '뒤처짐', color: 'warning', is: pr => pr.merge === 'behind' },
+  { text: '머지 가능', color: 'success', is: pr => pr.state === 'open' && pr.merge === 'clean' },
+  { text: 'CI 실패', color: '#d03b3b', is: pr => pr.checks === 'fail' },
+  { text: 'CI 진행 중', color: 'warning', is: pr => pr.checks === 'pending' },
+  { text: 'CI 통과', color: 'success', is: pr => pr.checks === 'pass' },
+  { text: '변경 요청', color: '#d03b3b', is: pr => pr.review === 'changes' },
+  { text: '리뷰 필요', color: 'warning', is: pr => pr.review === 'required' },
+  { text: '승인됨', color: 'success', is: pr => pr.review === 'approved' },
+]
 
 const snapshotAtom = atom({ plugin: 'statusbar', key: 'snapshot' } as const, null, {
   shape: 'v1',
@@ -139,9 +165,20 @@ type State = {
   isQueued: boolean
   git: StatusbarGit | undefined
   gitTicker: Timer | undefined
+  // 지금 브랜치의 PR을 찾는 열쇠(저장소 뿌리·origin 소유자·브랜치). 원격이 없거나 HEAD가 떨어지면 없다.
+  prKey: string | undefined
+  pr: { key: string; value?: StatusbarPullRequest; isMergeUnknown: boolean; fetchedAt: number } | undefined
+  isPrStale: boolean
+  isPrFetching: boolean
+  prRetryAt: number
+  prFailures: number
   gitQueue: Promise<void>
   isGitQueued: boolean
 }
+
+type GitReading = { root: string; remote: string | null; git: StatusbarGit }
+// PR을 찾을 브랜치와, 그 브랜치를 올린 저장소(origin)의 소유자.
+type PullRequestTarget = { key: string; branch: string; owner: string }
 
 // 애니메이션의 현재 칸. 움직임을 줄인 설정이면 undefined로 멈춘 모습을 그린다.
 type Frame = number | undefined
@@ -187,6 +224,12 @@ export const register: Register = on => {
     isQueued: false,
     git: undefined,
     gitTicker: undefined,
+    prKey: undefined,
+    pr: undefined,
+    isPrStale: false,
+    isPrFetching: false,
+    prRetryAt: 0,
+    prFailures: 0,
     gitQueue: Promise.resolve(),
     isGitQueued: false,
   }
@@ -208,7 +251,7 @@ export const register: Register = on => {
   // 도구의 결과는 손대지 않고 그대로 돌려준다: 파일을 바꾼 도구가 끝나면 git 상태를 다시 읽는다.
   on('tool.call', { tool: WATCHED_TOOLS }, async ($, e, next) => {
     const result = await next(e)
-    if (state.isLive) noteTool($, state, result)
+    if (state.isLive) noteTool($, state, e, result)
 
     return result
   }).catch(($, e, next) => next(e))
@@ -448,7 +491,7 @@ function snapshotOf(
   const fiveHour = pickWindow(usage.rateLimits, 'five_hour') ?? state.seed.fiveHour
   const sevenDay = pickWindow(usage.rateLimits, 'seven_day') ?? state.seed.sevenDay
 
-  const { git } = state
+  const git = gitOf(state)
 
   return {
     model,
@@ -533,9 +576,23 @@ function refreshGit($: EngineInterface, state: State): Promise<void> {
   return state.gitQueue
 }
 
+// 지금 브랜치의 PR을 찾았으면 git 값에 붙인다.
+function gitOf(state: State): StatusbarGit | undefined {
+  const { git, pr, prKey } = state
+  if (git === undefined || prKey === undefined || pr?.key !== prKey || pr.value === undefined) return git
+
+  return { ...git, pr: pr.value }
+}
+
 async function runGitRefresh($: EngineInterface, state: State): Promise<void> {
   try {
-    state.git = await readGit($)
+    const [reading, now] = await Promise.all([readGit($), $.clock.now()])
+    const target = pullRequestTargetOf(reading)
+    state.git = reading?.git
+    state.prKey = target?.key
+    if (target !== undefined && isPullRequestDue(state, now)) {
+      void fetchPullRequest($, state, target, now).then(() => schedule($, state))
+    }
     schedule($, state)
   } catch (error) {
     // 잠깐의 실패(시간 초과 등)로 줄이 깜빡이지 않도록 마지막 값을 둔다.
@@ -545,7 +602,7 @@ async function runGitRefresh($: EngineInterface, state: State): Promise<void> {
 
 // 저장소 밖이거나 git이 상태를 못 읽으면 undefined: git 줄을 그리지 않는다. 다른 git 명령과
 // index.lock을 다투지 않도록 선택적 잠금을 끄고 읽는다.
-async function readGit($: EngineInterface): Promise<StatusbarGit | undefined> {
+async function readGit($: EngineInterface): Promise<GitReading | undefined> {
   const repo = await $.session.repo()
   if (repo === null) return undefined
   const [status, paths] = await Promise.all([
@@ -561,11 +618,121 @@ async function readGit($: EngineInterface): Promise<StatusbarGit | undefined> {
   const operation = gitDir === '' ? undefined : await operationIn($, gitDir)
 
   return {
-    project: baseName(repo.root),
-    ...(isWorktree ? { worktree: baseName(top) } : {}),
-    ...(operation !== undefined ? { operation } : {}),
-    ...gitStatusOf(status),
+    root: repo.root,
+    remote: repo.remote,
+    git: {
+      project: baseName(repo.root),
+      ...(isWorktree ? { worktree: baseName(top) } : {}),
+      ...(operation !== undefined ? { operation } : {}),
+      ...gitStatusOf(status),
+    },
   }
+}
+
+// 원격이 있고 브랜치 위에 있을 때만 PR을 찾는다.
+function pullRequestTargetOf(reading: GitReading | undefined): PullRequestTarget | undefined {
+  const branch = reading?.git.branch
+  const owner = remoteOwner(reading?.remote ?? null)
+  if (reading === undefined || branch === undefined || owner === undefined) return undefined
+
+  return { key: `${reading.root}\n${owner}\n${branch}`, branch, owner }
+}
+
+// https://github.com/<owner>/<repo>.git, git@github.com:<owner>/<repo>.git, ssh://git@host/<owner>/<repo>.
+export function remoteOwner(remote: string | null): string | undefined {
+  const match = remote === null ? null : /[/:]([^/:]+)\/[^/:]+?(?:\.git)?\/?$/.exec(remote)
+
+  return match?.[1]
+}
+
+function isPullRequestDue(state: State, now: number): boolean {
+  const { prKey, pr } = state
+  if (prKey === undefined || state.isPrFetching || now < state.prRetryAt) return false
+  if (pr?.key !== prKey || state.isPrStale) return true
+
+  return now - pr.fetchedAt >= (pr.isMergeUnknown ? PR_UNKNOWN_RETRY_MS : PR_REFRESH_MS)
+}
+
+// 지금 브랜치를 head로 하고 그 head가 origin 소유자의 것인 PR 가운데 가장 최근 것(닫힌 것·병합된
+// 것 포함). gh가 없거나 로그인 전이거나 GitHub 저장소가 아니면 실패로 보고 물러났다가 다시 묻는다.
+async function fetchPullRequest($: EngineInterface, state: State, target: PullRequestTarget, now: number): Promise<void> {
+  state.isPrFetching = true
+  state.isPrStale = false
+  try {
+    const { exitCode, stdout, stderr } = await $.process.run(
+      ['gh', 'pr', 'list', '--head', target.branch, '--state', 'all', '--limit', String(PR_LIST_LIMIT), '--json', PR_FIELDS],
+      { timeoutMs: PR_TIMEOUT_MS, env: { GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' } },
+    )
+    if (exitCode !== 0) throw new Error(stderr.trim().split('\n')[0] || `gh exited ${exitCode}`)
+    const row = ownRow(JSON.parse(stdout), target.owner)
+    const value = row === undefined ? undefined : pullRequestOf(row)
+    state.pr = {
+      key: target.key,
+      fetchedAt: now,
+      isMergeUnknown: row?.state === 'OPEN' && row.mergeable === 'UNKNOWN',
+      ...(value ? { value } : {}),
+    }
+    state.prFailures = 0
+    state.prRetryAt = 0
+  } catch (error) {
+    state.prFailures += 1
+    state.prRetryAt = now + Math.min(BACKOFF_MS * 2 ** (state.prFailures - 1), BACKOFF_CAP_MS)
+    $.ui.log(`statusbar: pull request not read: ${describe(error)}`, { to: 'debug' })
+  } finally {
+    state.isPrFetching = false
+  }
+}
+
+function ownRow(rows: unknown, owner: string): Json | undefined {
+  return (Array.isArray(rows) ? rows.filter(isRecord) : []).find(row => {
+    const head = row.headRepositoryOwner
+
+    return isRecord(head) && typeof head.login === 'string' && head.login.toLowerCase() === owner.toLowerCase()
+  })
+}
+
+// `gh pr list --json`의 한 줄을 상태로 줄인다.
+export function pullRequestOf(row: Json): StatusbarPullRequest | undefined {
+  const state =
+    row.state === 'MERGED' ? 'merged' : row.state === 'CLOSED' ? 'closed' : row.state === 'OPEN' ? (row.isDraft === true ? 'draft' : 'open') : undefined
+  if (state === undefined) return undefined
+  if (state === 'merged' || state === 'closed') return { state }
+  const merge =
+    row.mergeable === 'CONFLICTING' || row.mergeStateStatus === 'DIRTY'
+      ? 'conflict'
+      : row.mergeStateStatus === 'BEHIND'
+        ? 'behind'
+        : row.mergeStateStatus === 'CLEAN' || row.mergeStateStatus === 'HAS_HOOKS'
+          ? 'clean'
+          : undefined
+  const checks = checksOf(row.statusCheckRollup)
+  const review =
+    row.reviewDecision === 'APPROVED'
+      ? 'approved'
+      : row.reviewDecision === 'CHANGES_REQUESTED'
+        ? 'changes'
+        : row.reviewDecision === 'REVIEW_REQUIRED'
+          ? 'required'
+          : undefined
+
+  return { state, ...(merge ? { merge } : {}), ...(checks ? { checks } : {}), ...(review ? { review } : {}) }
+}
+
+// 검사 하나라도 실패면 실패, 아니면 하나라도 도는 중이면 진행 중, 모두 끝나 통과면 통과.
+function checksOf(rollup: unknown): StatusbarPullRequest['checks'] {
+  const results = (Array.isArray(rollup) ? rollup.filter(isRecord) : []).map(check => {
+    // CheckRun은 status·conclusion, StatusContext는 state를 준다.
+    const value = String(check.conclusion ?? check.state ?? '')
+    if (check.status !== undefined && check.status !== 'COMPLETED') return 'pending'
+    if (['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(value)) return 'pass'
+    if (['PENDING', 'EXPECTED', 'QUEUED', 'IN_PROGRESS', ''].includes(value)) return 'pending'
+
+    return 'fail'
+  })
+  if (results.length === 0) return undefined
+  if (results.includes('fail')) return 'fail'
+
+  return results.includes('pending') ? 'pending' : 'pass'
 }
 
 // 스태시 수(--show-stash)는 git 2.35부터라 그 전 git이면 빼고 다시 읽는다.
@@ -626,10 +793,19 @@ export function gitStatusOf(text: string): Omit<StatusbarGit, 'project' | 'workt
   }
 }
 
-// 파일을 바꿨을 수 있는 도구(읽기 전용이 아닌 호출)가 끝나면 git 상태를 다시 읽는다.
-function noteTool($: EngineInterface, state: State, result: ToolCallResult): void {
-  if (result.deny !== undefined || result.isError === true || result.isReadOnly === true) return
-  $.clock.after(0, () => void refreshGit($, state))
+// 파일을 바꿨을 수 있는 도구(읽기 전용이 아닌 호출)가 끝나면 git 상태를 다시 읽는다. 푸시나 PR
+// 명령은 실패로 끝나도(gh가 GitHub 오류를 받고도 PR은 만들어짐) PR 상태를 곧바로 다시 묻는다.
+function noteTool($: EngineInterface, state: State, e: ToolCallInput, result: ToolCallResult): void {
+  const operation = isRecord(result.result) ? result.result.gitOperation : undefined
+  const touchesPr =
+    (e.tool === 'Bash' && PR_COMMAND.test(e.command)) ||
+    (isRecord(operation) && (operation.pr !== undefined || operation.push !== undefined))
+  if (touchesPr) {
+    state.isPrStale = true
+    state.prRetryAt = 0
+  }
+  const isWrite = result.deny === undefined && result.isError !== true && result.isReadOnly !== true
+  if (touchesPr || isWrite) $.clock.after(0, () => void refreshGit($, state))
 }
 
 // 사용량 줄(좁으면 여러 줄) 아래에 git 줄을 둔다. git 줄은 저장소 안에서만 그린다.
@@ -647,19 +823,24 @@ function usageRows(snapshot: StatusbarSnapshot, columns: number, frame: Frame): 
   return rows
 }
 
-// 셸 프롬프트처럼 이어 쓰고 · 로 나눈다: 프로젝트[/워크트리] · 브랜치 (진행 중 작업) · 상태.
-// 넘치면 브랜치 이름을 줄인다.
+// 셸 프롬프트처럼 이어 쓰고 · 로 나눈다: 프로젝트[/워크트리] · 브랜치 (진행 중 작업) · 상태 · PR 상태.
+// 넘치면 브랜치 이름을 줄이고, 그래도 넘치면 PR 상태를 뺀다.
 function gitRows(git: StatusbarGit | undefined, columns: number): Span[][] {
   if (git === undefined) return []
-  const full = gitSpans(git)
-  const overflow = widthOf(full) - columns
-  if (overflow <= 0) return [full]
   const head = git.branch ?? git.commit ?? '?'
+  let row: Span[] = []
+  for (const hasPr of [true, false]) {
+    row = gitSpans(git, hasPr)
+    const overflow = widthOf(row) - columns
+    if (overflow <= 0) return [row]
+    row = gitSpans(git, hasPr, Math.max(MIN_BRANCH_COLUMNS, displayWidth(head) - overflow))
+    if (widthOf(row) <= columns) return [row]
+  }
 
-  return [gitSpans(git, Math.max(MIN_BRANCH_COLUMNS, displayWidth(head) - overflow))]
+  return [row]
 }
 
-function gitSpans(git: StatusbarGit, branchColumns = Number.POSITIVE_INFINITY): Span[] {
+function gitSpans(git: StatusbarGit, hasPr: boolean, branchColumns = Number.POSITIVE_INFINITY): Span[] {
   const place = git.worktree === undefined ? git.project : `${git.project}/${git.worktree}`
   const status = gitStatusText(git)
   const groups = [
@@ -674,11 +855,20 @@ function gitSpans(git: StatusbarGit, branchColumns = Number.POSITIVE_INFINITY): 
         : [span(` (${git.operation.toUpperCase()})`, { color: GIT_STATUS_COLOR, bold: true })]),
     ],
     status === '' ? [] : [span(status, { color: GIT_STATUS_COLOR })],
+    hasPr && git.pr !== undefined ? pullRequestSpans(git.pr) : [],
   ]
 
   return joinSpans(
     groups.filter(group => group.length > 0),
     [span(' '), span('·', { color: FAINT }), span(' ')],
+  )
+}
+
+// PR 상태 말들을 두 칸씩 띄워 늘어놓는다.
+function pullRequestSpans(pr: StatusbarPullRequest): Span[] {
+  return joinSpans(
+    PR_LABELS.filter(label => label.is(pr)).map(label => [span(label.text, { color: label.color })]),
+    [span('  ')],
   )
 }
 
