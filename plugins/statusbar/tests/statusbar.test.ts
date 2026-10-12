@@ -48,7 +48,7 @@ const HEADER_LIMITS: SessionRateLimit[] = [
 ]
 
 const LIMITS = 'S ━━━─────── 28%  ↻2h13m   W ━━━━────── 42%  ↻3d'
-const OPUS_ROW = `✻ Opus 5.5  effort ?  │  C ━━──────── 23%  46k/200k  │  ${LIMITS}`
+const OPUS_ROW = `✻ Opus 5.5  effort ? · C ━━──────── 23%  46k/200k · ${LIMITS}`
 
 const ROOT = '/work/my-claude'
 const REMOTE = 'https://github.com/DevooKim/my-claude.git'
@@ -353,12 +353,12 @@ describe('status line under the prompt', () => {
 
     await step($, { model: 'claude-opus-5-5', effort: 'max' })
     await clock.settle()
-    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●●● max  │  C ')
+    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●●● max · C ')
 
     // 서브에이전트의 요청은 메인의 effort를 바꾸지 않는다.
     await step($, { model: 'claude-haiku-5-5', effort: 'low', agentId: 'sub-1' })
     await clock.settle()
-    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●●● max  │')
+    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●●● max ·')
   })
 
   test('after /clear empties the session state the bar is drawn again at once', async ($, on) => {
@@ -374,7 +374,7 @@ describe('status line under the prompt', () => {
     expect(await footer($)).toEqual([ENGINE_LINE])
     await clock.settle()
     expect(await bar($)).toEqual(before)
-    expect(before[0]).toStartWith('✻ Opus 5.5  ●●●○○ high  │')
+    expect(before[0]).toStartWith('✻ Opus 5.5  ●●●○○ high ·')
   })
 
   test('an emptied snapshot is written again by the next refresh in the same minute', async ($, on) => {
@@ -409,7 +409,7 @@ describe('status line under the prompt', () => {
       uuid: 'row-effort',
     })
     await clock.settle()
-    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●○○ high  │')
+    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●○○ high ·')
   })
 
   test('before the first request effort comes from the settings', async ($, on) => {
@@ -420,7 +420,7 @@ describe('status line under the prompt', () => {
 
     await $.session.start(START)
     await clock.settle()
-    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●○○ high  │')
+    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●○○ high ·')
   })
 
   test('the effort environment variable wins over the settings', async ($, on) => {
@@ -432,7 +432,7 @@ describe('status line under the prompt', () => {
 
     await $.session.start(START)
     await clock.settle()
-    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●○○○ medium  │')
+    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●○○○ medium ·')
   })
 
   test('a model that takes no effort shows none; the countdowns move with the clock', async ($, on) => {
@@ -441,7 +441,7 @@ describe('status line under the prompt', () => {
     await $.session.start(START)
     await step($, { model: world.model })
     await clock.settle()
-    expect((await bar($))[0]).toBe(`✻ Haiku 5.5  │  C ━━──────── 23%  46k/200k  │  ${LIMITS}`)
+    expect((await bar($))[0]).toBe(`✻ Haiku 5.5 · C ━━──────── 23%  46k/200k · ${LIMITS}`)
 
     await clock.advance(60 * MINUTE)
     expect((await bar($))[0]).toEndWith('28%  ↻1h13m   W ━━━━────── 42%  ↻3d')
@@ -497,7 +497,7 @@ describe('status line under the prompt', () => {
     await $.session.start(START)
     await step($, { model: world.model, effort: 'max' })
     await clock.settle()
-    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●●● max  │')
+    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●●● max ·')
 
     // classic.PostModelSwitch 없이 /model의 결과 줄만 온다.
     world.model = 'claude-sonnet-5-5'
@@ -516,7 +516,7 @@ describe('status line under the prompt', () => {
       uuid: 'row-model',
     })
     await clock.settle()
-    expect((await bar($))[0]).toStartWith('✻ Sonnet 5.5  ●●○○○ medium  │')
+    expect((await bar($))[0]).toStartWith('✻ Sonnet 5.5  ●●○○○ medium ·')
   })
 
   test('switching to Fable resets effort and reads the Fable limit', async ($, on) => {
@@ -542,7 +542,7 @@ describe('status line under the prompt', () => {
     await clock.settle()
     expect(fetches).toHaveLength(1)
     const [row] = await bar($)
-    expect(row).toStartWith('✻ Fable 5.1  effort ?  │')
+    expect(row).toStartWith('✻ Fable 5.1  effort ? ·')
     expect(row).toEndWith('Fable ━━━━━━──── 60%')
   })
 
@@ -552,7 +552,7 @@ describe('status line under the prompt', () => {
     await $.session.start(START)
     await clock.settle()
     expect(fetches).toHaveLength(1)
-    expect(await bar($)).toEqual([`✻ Opus 5.5  effort ?  │  C ────────── —  —/200k  │  ${LIMITS}`])
+    expect(await bar($)).toEqual([`✻ Opus 5.5  effort ? · C ────────── —  —/200k · ${LIMITS}`])
   })
 
   test('an API-key session shows no plan limits and never calls the endpoint', async ($, on) => {
@@ -566,7 +566,7 @@ describe('status line under the prompt', () => {
     await clock.settle()
     await clock.advance(60 * MINUTE)
     expect(fetches).toHaveLength(0)
-    expect(await bar($)).toEqual(['✻ Fable 5.1  effort ?  │  C ────────── —  —/200k'])
+    expect(await bar($)).toEqual(['✻ Fable 5.1  effort ? · C ────────── —  —/200k'])
   })
 
   test('before the first reading only the engine line is drawn', async ($, on) => {
@@ -581,7 +581,7 @@ describe('status line under the prompt', () => {
     await $.session.start(START)
     await clock.settle()
     expect(await bar($, { columns: 80 })).toEqual([
-      '✻ Opus 5.5  effort ?  │  C ━━──────── 23%  46k/200k',
+      '✻ Opus 5.5  effort ? · C ━━──────── 23%  46k/200k',
       LIMITS,
     ])
   })

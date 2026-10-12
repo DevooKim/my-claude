@@ -20,7 +20,7 @@ Claude Code 프롬프트에서:
 프롬프트 입력창 아래 힌트 줄 밑에 상태 줄을 그립니다.
 
 ```
-✻ Opus 5.5  ●●●○○ high  │  C ━━━━━━━─── 71%  715k/1M  │  S ━───────── 13%  ↻3h35m   W ━───────── 4%  ↻5d
+✻ Opus 5.5  ●●●○○ high · C ━━━━━━━─── 71%  715k/1M · S ━───────── 13%  ↻3h35m   W ━───────── 4%  ↻5d
 my-claude/fix-bar · worktree-fix-bar · !3+2?1⇡1 · PR #12
 ● Explore · Find the auth code 1m12s  │  T ●●●●○○○ 3/7  Running tests
 ```

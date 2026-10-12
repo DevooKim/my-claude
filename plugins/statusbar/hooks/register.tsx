@@ -1247,7 +1247,7 @@ function composeRows(snapshot: StatusbarSnapshot, variant: Variant, frame: Frame
   const head = headSpans(snapshot, frame)
   const context = contextMeter(snapshot, variant)
   const limits = limitMeters(snapshot, variant)
-  const separator = [span('  '), span('│', { color: FAINT }), span('  ')]
+  const separator = [span(' '), span('·', { color: FAINT }), span(' ')]
   const joined = joinSpans(limits, [span('   ')])
   const rows =
     variant.rows === 'one'
