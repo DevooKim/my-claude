@@ -36,8 +36,8 @@ const HEADER_LIMITS: SessionRateLimit[] = [
   { kind: 'seven_day', percentUsed: 42, resetsAt: WEEK_RESET },
 ]
 
-const LIMITS = '5h ━━━─────── 28%  ↻2h13m   주간 ━━━━────── 42%  ↻3d'
-const OPUS_ROW = `✻ Opus 5.5  effort ?  │  ctx ━━──────── 23%  46k/200k  │  ${LIMITS}`
+const LIMITS = 'S ━━━─────── 28%  ↻2h13m   W ━━━━────── 42%  ↻3d'
+const OPUS_ROW = `✻ Opus 5.5  effort ?  │  C ━━──────── 23%  46k/200k  │  ${LIMITS}`
 
 const usageOf = (rateLimits: SessionRateLimit[], tokens?: number): SessionUsage => ({
   startedAt: NOW,
@@ -75,6 +75,8 @@ type World = {
   auth: SessionAuthorization
   answers: Answer[]
   isReducedMotion: boolean
+  settings: Record<string, unknown>
+  env: Record<string, string>
 }
 
 function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
@@ -83,6 +85,8 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
     auth: { handle: 'auth_test', kind: 'bearer' },
     answers: [],
     isReducedMotion: false,
+    settings: {},
+    env: {},
     ...initial,
   }
   const fetches: { url: string; auth?: string; beta?: string }[] = []
@@ -106,7 +110,8 @@ function setUp(on: On, initial: Partial<World> & Pick<World, 'model'>) {
   })
   on('ui.status', () => ({ value: undefined }))
   on('ui.log', () => ({ value: undefined }))
-  on('settings.read', () => ({ value: { prefersReducedMotion: world.isReducedMotion } }))
+  on('settings.read', () => ({ value: { ...world.settings, prefersReducedMotion: world.isReducedMotion } }))
+  on('env.get', ($, e) => ({ value: world.env[e.name] }))
   const redraws = { count: 0 }
   on('ui.invalidate', ($, e, next) => {
     redraws.count += 1
@@ -195,7 +200,7 @@ describe('status line under the prompt', () => {
 
     await step($, { model: 'claude-opus-5-5', effort: 'max' })
     await clock.settle()
-    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●●● max  │  ctx ')
+    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●●● max  │  C ')
 
     // 서브에이전트의 요청은 메인의 effort를 바꾸지 않는다.
     await step($, { model: 'claude-haiku-5-5', effort: 'low', agentId: 'sub-1' })
@@ -225,16 +230,39 @@ describe('status line under the prompt', () => {
     expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●○○ high  │')
   })
 
+  test('before the first request effort comes from the settings', async ($, on) => {
+    const { clock } = setUp(on, {
+      model: 'claude-opus-5-5',
+      settings: { effortLevel: 'low', modelSettings: { 'claude-opus-5-5': { effortLevel: 'high' } } },
+    })
+
+    await $.session.start(START)
+    await clock.settle()
+    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●●○○ high  │')
+  })
+
+  test('the effort environment variable wins over the settings', async ($, on) => {
+    const { clock } = setUp(on, {
+      model: 'claude-opus-5-5',
+      settings: { effortLevel: 'low' },
+      env: { CLAUDE_CODE_EFFORT_LEVEL: 'medium' },
+    })
+
+    await $.session.start(START)
+    await clock.settle()
+    expect((await bar($))[0]).toStartWith('✻ Opus 5.5  ●●○○○ medium  │')
+  })
+
   test('a model that takes no effort shows none; the countdowns move with the clock', async ($, on) => {
     const { clock, world } = setUp(on, { model: 'claude-haiku-5-5' })
 
     await $.session.start(START)
     await step($, { model: world.model })
     await clock.settle()
-    expect((await bar($))[0]).toBe(`✻ Haiku 5.5  │  ctx ━━──────── 23%  46k/200k  │  ${LIMITS}`)
+    expect((await bar($))[0]).toBe(`✻ Haiku 5.5  │  C ━━──────── 23%  46k/200k  │  ${LIMITS}`)
 
     await clock.advance(60 * MINUTE)
-    expect((await bar($))[0]).toEndWith('28%  ↻1h13m   주간 ━━━━────── 42%  ↻3d')
+    expect((await bar($))[0]).toEndWith('28%  ↻1h13m   W ━━━━────── 42%  ↻3d')
   })
 
   test('on Fable it adds the used Fable weekly limit from the usage endpoint', async ($, on) => {
@@ -311,7 +339,7 @@ describe('status line under the prompt', () => {
     await $.session.start(START)
     await clock.settle()
     expect(fetches).toHaveLength(1)
-    expect(await bar($)).toEqual([`✻ Opus 5.5  effort ?  │  ctx ────────── —  —/200k  │  ${LIMITS}`])
+    expect(await bar($)).toEqual([`✻ Opus 5.5  effort ?  │  C ────────── —  —/200k  │  ${LIMITS}`])
   })
 
   test('an API-key session shows no plan limits and never calls the endpoint', async ($, on) => {
@@ -325,7 +353,7 @@ describe('status line under the prompt', () => {
     await clock.settle()
     await clock.advance(60 * MINUTE)
     expect(fetches).toHaveLength(0)
-    expect(await bar($)).toEqual(['✻ Fable 5.1  effort ?  │  ctx ────────── —  —/200k'])
+    expect(await bar($)).toEqual(['✻ Fable 5.1  effort ?  │  C ────────── —  —/200k'])
   })
 
   test('before the first reading only the engine line is drawn', async ($, on) => {
@@ -340,7 +368,7 @@ describe('status line under the prompt', () => {
     await $.session.start(START)
     await clock.settle()
     expect(await bar($, { columns: 80 })).toEqual([
-      '✻ Opus 5.5  effort ?  │  ctx ━━──────── 23%  46k/200k',
+      '✻ Opus 5.5  effort ?  │  C ━━──────── 23%  46k/200k',
       LIMITS,
     ])
   })
@@ -421,12 +449,12 @@ describe('layout', () => {
     const colorAfter = (label: string) =>
       row[row.findIndex(part => part.text === `${label} `) + 1]?.style?.color
 
-    expect(colorAfter('ctx')).toBe('#fab219')
-    expect(colorAfter('5h')).toBe('#d03b3b')
-    expect(colorAfter('주간')).toBe('#0ca30c')
+    expect(colorAfter('C')).toBe('#fab219')
+    expect(colorAfter('S')).toBe('#d03b3b')
+    expect(colorAfter('W')).toBe('#0ca30c')
     expect(colorAfter('Fable')).toBe('#ec835a')
     expect(row.filter(part => part.text === ' !')).toHaveLength(1)
-    expect(textOfRow(row)).toContain('5h ━━━━━━━━━─ 92% !  ↻2h13m')
+    expect(textOfRow(row)).toContain('S ━━━━━━━━━─ 92% !  ↻2h13m')
     expect(textOfRow(row)).toContain('Fable ━━━━━━━━── 80%  ↻3d')
   })
 

@@ -35,6 +35,12 @@ const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max']
 const BRAND = 'claude'
 const MUTED = 'inactive'
 const FAINT = 'subtle'
+// 한 글자 라벨이 서로 구분되도록 각자 테마 색을 입힌다. 그 밖의 라벨은 MUTED.
+const LABEL_COLORS: Readonly<Record<string, string>> = {
+  C: 'claude',
+  S: 'suggestion',
+  W: 'planMode',
+}
 // 바의 색은 남은 비율의 단계: 라이트·다크 양쪽에서 검증된 고정 상태 색이다.
 const STATUS_COLORS = {
   good: '#0ca30c',
@@ -151,6 +157,7 @@ export const register: Register = on => {
       // 0.1.0이 고정해 둔 한 줄짜리 상태줄을 걷어 낸다.
       $.ui.status(undefined)
       await restore($, state)
+      if (state.effort.kind === 'unknown') state.effort = await configuredEffort($)
       state.isReducedMotion = await prefersReducedMotion($)
       state.ticker?.cancel()
       state.ticker = $.clock.every(TICK_MS, () => void refresh($, state))
@@ -184,8 +191,8 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  on('classic.PostModelSwitch', ($, e, next) => {
-    state.effort = { kind: 'unknown' }
+  on('classic.PostModelSwitch', async ($, e, next) => {
+    state.effort = await configuredEffort($, e.to_model)
     if (isFable(e.to_model)) state.isFableRequested = true
     syncAnimation($, state)
     schedule($, state)
@@ -228,6 +235,29 @@ async function restore($: EngineInterface, state: State): Promise<void> {
   state.effort = previous.effort
   if (previous.fable !== undefined) state.fable = previous.fable
   if (previous.fableFetchedAt !== undefined) state.lastFetchedAt = previous.fableFetchedAt
+}
+
+// 첫 요청 전에는 보낼 effort를 알 길이 없으므로 엔진이 읽는 설정에서 미리 짐작한다:
+// 환경 변수 → 모델별 설정(modelSettings) → effortLevel. 첫 요청이 실제 값으로 고친다.
+async function configuredEffort($: EngineInterface, model?: string): Promise<StatusbarEffort> {
+  try {
+    const [fromEnv, settings, current] = await Promise.all([
+      $.env.get('CLAUDE_CODE_EFFORT_LEVEL'),
+      $.settings.read(),
+      model === undefined ? $.session.model() : Promise.resolve(model),
+    ])
+    const modelSettings = isRecord(settings.modelSettings) ? settings.modelSettings[current] : undefined
+    const perModel = isRecord(modelSettings) ? modelSettings.effortLevel : undefined
+    const level = [fromEnv, perModel, settings.effortLevel].find(
+      (value): value is string => typeof value === 'string' && EFFORT_LEVELS.includes(value),
+    )
+
+    return level === undefined ? { kind: 'unknown' } : { kind: 'level', level }
+  } catch (error) {
+    $.ui.log(`statusbar: effort setting not read: ${describe(error)}`, { to: 'debug' })
+
+    return { kind: 'unknown' }
+  }
 }
 
 function noteStepEffort($: EngineInterface, state: State, effort: TurnStepInput['effort']): void {
@@ -467,17 +497,17 @@ function painterFor(level: string, length: number, frame: Frame): (index: number
 function contextMeter(snapshot: StatusbarSnapshot, variant: Variant): Span[] {
   const { tokens, window, percent } = snapshot.context
   const size = window > 0 ? formatTokens(window) : '?'
-  if (tokens === undefined) return meter('ctx', 0, MUTED, '—', `—/${size}`, variant)
+  if (tokens === undefined) return meter('C', 0, MUTED, '—', `—/${size}`, variant)
   const used = Math.round(percent ?? (window > 0 ? (tokens / window) * 100 : 0))
 
-  return usageMeter('ctx', used, `${formatTokens(tokens)}/${size}`, variant)
+  return usageMeter('C', used, `${formatTokens(tokens)}/${size}`, variant)
 }
 
 function limitMeters(snapshot: StatusbarSnapshot, variant: Variant): Span[][] {
   const { fiveHour, sevenDay, fable, now } = snapshot
   const meters: Span[][] = []
-  if (fiveHour) meters.push(windowMeter('5h', fiveHour, now, variant, 'minutes'))
-  if (sevenDay) meters.push(windowMeter('주간', sevenDay, now, variant, 'hours'))
+  if (fiveHour) meters.push(windowMeter('S', fiveHour, now, variant, 'minutes'))
+  if (sevenDay) meters.push(windowMeter('W', sevenDay, now, variant, 'hours'))
   if (fable && isFable(snapshot.model)) {
     if (fable.kind === 'unknown') meters.push(meter('Fable', 0, MUTED, '?', undefined, variant))
     if (fable.kind === 'absent') meters.push(meter('Fable', 0, MUTED, '—', undefined, variant))
@@ -532,7 +562,7 @@ function meter(
   const filled = ratio <= 0 ? 0 : Math.min(width, Math.max(1, Math.round(ratio * width)))
 
   return [
-    span(`${label} `, { color: MUTED }),
+    span(`${label} `, { color: LABEL_COLORS[label] ?? MUTED }),
     span(FILLED.repeat(filled), { color }),
     span(TRACK.repeat(width - filled), { color, dimColor: true }),
     span(` ${value}`, { bold: true }),
