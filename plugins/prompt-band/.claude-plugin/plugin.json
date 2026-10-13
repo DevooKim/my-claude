@@ -1,0 +1,9 @@
+{
+  "name": "prompt-band",
+  "version": "0.1.0",
+  "description": "프롬프트 위 띠(AbovePrompt)에 세션 지표를 오른쪽 끝에 붙여 표시: 지금은 마지막 응답의 프롬프트 캐시 적중률. 다른 플러그인의 띠와 위아래로 쌓인다",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "DevooKim"
+  }
+}

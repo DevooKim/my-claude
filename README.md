@@ -9,6 +9,7 @@ Claude Code 프롬프트에서:
 
 ```
 /plugin install statusbar --marketplace DevooKim/my-claude
+/plugin install prompt-band --marketplace DevooKim/my-claude
 ```
 
 마켓플레이스 추가 질문에는 `y`, 범위는 user를 고르면 됩니다.
@@ -44,3 +45,19 @@ git 줄 (저장소 안에서만)
 서브에이전트와 할 일(Task)은 Claude Code가 직접 보여 주므로 따로 그리지 않습니다.
 
 테스트: `claude plugin test plugins/statusbar`
+
+### prompt-band
+
+프롬프트 입력창 바로 위 띠(`AbovePrompt`)의 오른쪽 끝, 엔진의 접기 버튼 `[-]` 옆에 세션 지표를 그립니다.
+
+```
+                                                        Cache ◕ 93%  160k/172k  [-]
+```
+
+- 캐시: 메인 스레드의 마지막 응답에서 입력 토큰 가운데 프롬프트 캐시가 읽어 준 비율과 `읽은 양/전체`. 서브에이전트 응답은 세지 않음
+- 원 기호는 25% 단위로 내림(`○ ◔ ◑ ◕ ●`, 꽉 찬 원은 100%만), 숫자는 1% 단위
+- 색: 90% 이상 초록, 70% 이상 노랑, 40% 이상 주황, 그 아래 빨강
+- 첫 응답 전이나 설문이 떠 있을 때는 그리지 않음
+- 띠 자리는 하나라서 아래 플러그인이 그린 띠를 받아 그 위에 쌓음: 다른 띠 플러그인과 함께 켜도 둘 다 보임(그 플러그인도 `next(e)`를 품어야 함)
+
+테스트: `claude plugin test plugins/prompt-band`

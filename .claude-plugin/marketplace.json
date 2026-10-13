@@ -8,6 +8,11 @@
       "name": "statusbar",
       "source": "./plugins/statusbar",
       "description": "프롬프트 아래 상태 줄: 모델·effort, 컨텍스트, 5시간·주간(Fable이면 Fable 주간) 사용 한도를 프로그레스 바로, git 상태를 함께 표시"
+    },
+    {
+      "name": "prompt-band",
+      "source": "./plugins/prompt-band",
+      "description": "프롬프트 위 띠에 세션 지표를 오른쪽 끝에 표시: 마지막 응답의 프롬프트 캐시 적중률. 다른 플러그인의 띠와 위아래로 쌓임"
     }
   ],
   "description": "개인용 Claude Code 플러그인 마켓플레이스"

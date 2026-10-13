@@ -272,7 +272,15 @@ async function footer(
   expect(typeof rowsBox !== 'string' && rowsBox.type === 'Box' ? rowsBox.props?.marginTop : undefined).toBe(0)
   const rows = typeof rowsBox !== 'string' && 'children' in rowsBox ? (rowsBox.children ?? []) : []
 
-  return [textOf(own), ...rows.map(textOf)]
+  return [textOf(own), ...rows.flatMap(rowsIn).map(textOf)]
+}
+
+// 사용량 줄은 git 줄 아래 GIT_GAP만큼 띄운 세로 상자에 담긴다: 그 상자를 풀어 줄로 센다.
+function rowsIn(node: RenderElement | string): (RenderElement | string)[] {
+  if (typeof node === 'string' || node.type !== 'Box' || node.props?.flexDirection !== 'column') return [node]
+  const children: readonly (RenderElement | string)[] = 'children' in node ? (node.children ?? []) : []
+
+  return children.flatMap(rowsIn)
 }
 
 // 엔진의 줄을 지켰는지 확인하고 그 아래 상태 줄만 돌려준다.

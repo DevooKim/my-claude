@@ -113,6 +113,8 @@ const FALLBACK_COLUMNS = 120
 const MIN_COLUMNS = 20
 // 엔진의 힌트 줄과 상태 줄 사이의 빈 줄 수.
 const ROW_GAP = 0
+// git 줄과 사용량 줄 사이에 띄우는 줄 수.
+const GIT_GAP = 0
 // git 줄은 셸 프롬프트(starship)와 같은 모양·색으로 그린다: 경로는 굵은 하늘색, 브랜치는 굵은
 // 회색, 상태는 노란색으로 붙여 쓴다(=충돌 $스태시 ×삭제 »이름 바꿈 !수정 +스테이징 ?추적 안 함
 // ⇡앞섬 ⇣뒤처짐). yellow·gray·green은 터미널 팔레트의 그 색이다.
@@ -338,7 +340,10 @@ export const register: Register = on => {
       <Box flexDirection="column">
         {own}
         <Box flexDirection="column" marginTop={ROW_GAP}>
-          {layoutRows(snapshot, columns, frame).map(drawRow)}
+          {gitRows(snapshot.git, columns).map(drawRow)}
+          <Box flexDirection="column" marginTop={snapshot.git ? GIT_GAP : 0}>
+            {usageRows(snapshot, columns, frame).map(drawRow)}
+          </Box>
         </Box>
       </Box>
     )
